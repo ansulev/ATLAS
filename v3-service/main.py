@@ -441,7 +441,7 @@ def score_candidate_per_step(code: str) -> dict:
         if not data.get("enabled"):
             return {}
         agg = data.get("aggregate", {}) or {}
-        return {
+        result = {
             "n_tokens":            int(data.get("n_tokens", 0)),
             "gx_available":        bool(data.get("gx_available", False)),
             "first_off_rails_idx": int(agg.get("first_off_rails_idx", -1)),
@@ -451,6 +451,13 @@ def score_candidate_per_step(code: str) -> dict:
             "cx_norm_mean":        float(agg.get("cx_norm_mean", 0.0)),
             "latency_ms":          float(data.get("latency_ms", 0.0)),
         }
+        print(
+            f"  [lens] candidate scored: n_tok={result['n_tokens']} "
+            f"gx_min={result['gx_score_min']:.3f} gx_mean={result['gx_score_mean']:.3f} "
+            f"off_rails={result['first_off_rails_idx']} lat={result['latency_ms']:.0f}ms",
+            flush=True,
+        )
+        return result
     except Exception as e:
         print(f"  [lens] score_candidate_per_step failed: {e} — degrading to no per-step signal", flush=True)
         return {}

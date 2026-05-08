@@ -1139,7 +1139,19 @@ async def lens_score_per_step(request: LensScorePerStepRequest):
                 "per_step": [], "aggregate": {}, "n_tokens": 0,
             }
 
-        return evaluate_per_step(request.text, layer=request.layer)
+        result = evaluate_per_step(request.text, layer=request.layer)
+        agg = result.get("aggregate") or {}
+        logger.info(
+            "lens score-per-step: in_chars=%d n_tok=%d gx_min=%.3f gx_mean=%.3f off_rails=%d layer=%s lat=%.0fms",
+            len(request.text or ""),
+            int(result.get("n_tokens", 0)),
+            float(agg.get("gx_score_min", 0.0)),
+            float(agg.get("gx_score_mean", 0.0)),
+            int(agg.get("first_off_rails_idx", -1)),
+            str(request.layer) if request.layer is not None else "last",
+            float(result.get("latency_ms", 0.0)),
+        )
+        return result
     except Exception as e:
         logger.error(f"Lens score-per-step failed: {e}")
         return {

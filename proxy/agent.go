@@ -578,6 +578,11 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			if scorable, ok := extractScorableContent(parsed.Name, parsed.Args); ok {
 				if score, scored := scoreContentForAgent(ctx.Ctx, ctx.LensURL, scorable); scored {
 					ctx.LensScoreHistory = append(ctx.LensScoreHistory, score.Aggregate.GxScoreMin)
+					log.Printf("[agent] lens turn=%d tool=%s gx_min=%.3f gx_mean=%.3f off_rails=%d n_tok=%d latency=%.0fms history=%s",
+						turn, parsed.Name,
+						score.Aggregate.GxScoreMin, score.Aggregate.GxScoreMean,
+						score.Aggregate.FirstOffRailsIdx, score.NTokens,
+						score.LatencyMS, formatScoreSlice(ctx.LensScoreHistory))
 					ctx.Stream("agent_lens_score", map[string]interface{}{
 						"tool":                 parsed.Name,
 						"turn":                 turn,
