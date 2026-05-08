@@ -1888,6 +1888,58 @@ def _ast_selector_to_query(selector: str, language: str):
     return None, None, f"unsupported language: {language}"
 
 
+def cyclomatic_complexity(path: str, source_text: str) -> dict:
+    """McCabe-style cyclomatic complexity from tree-sitter AST.
+
+    Counts decision points across the whole file (sum of per-function CC,
+    not strictly McCabe's per-function definition — we want one number for
+    tier classification, not a per-symbol map). Decision-point set targets
+    the things that actually predict V3-pipeline benefit: branches, loops,
+    exception handlers, short-circuit booleans, comprehensions with filters,
+    match/case clauses.
+
+    v1 supports Python only. HTML CC isn't meaningful (markup, no real
+    branching in tree-sitter's view of it — Jinja control blocks parse as
+    text content). Other languages return {"ok": False} so the proxy's
+    regex-based classifyFileTier stays the fallback floor.
+    """
+    if not _AST_EDIT_AVAILABLE:
+        return {"ok": False, "error": "tree-sitter not installed in this build"}
+
+    p = (path or "").lower()
+    if not p.endswith(".py"):
+        return {"ok": False, "error": f"cyclomatic_complexity v1 supports .py only (got {path})"}
+
+    try:
+        parser = _ts.Parser(_PY_LANG)
+        tree = parser.parse(source_text.encode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"parse failed: {type(e).__name__}: {e}"}
+
+    # Decision-point node types in Python's tree-sitter grammar.
+    # Each adds 1 to CC. `if_clause` inside a comprehension is the
+    # filter clause (e.g. `[x for x in xs if x > 0]`) and counts as a branch.
+    DECISION = {
+        "if_statement", "elif_clause",
+        "for_statement", "while_statement",
+        "except_clause",
+        "conditional_expression",  # ternary x if cond else y
+        "boolean_operator",        # and / or short-circuit
+        "case_clause",             # match-case
+        "if_clause",               # comprehension filter
+    }
+
+    cc = 1  # base path
+    stack = [tree.root_node]
+    while stack:
+        n = stack.pop()
+        if n.type in DECISION:
+            cc += 1
+        stack.extend(n.children)
+
+    return {"ok": True, "language": "python", "cyclomatic_complexity": cc}
+
+
 def ast_edit(path: str, source_text: str, selector: str, content: str) -> dict:
     """Apply a friendly-selector AST edit. Stateless transform — caller provides
     the source bytes (read from their own filesystem) and gets back new content.
@@ -1978,6 +2030,8 @@ class V3Handler(BaseHTTPRequestHandler):
             self._handle_plan()
         elif self.path == "/internal/ast_edit":
             self._handle_ast_edit()
+        elif self.path == "/internal/cyclomatic_complexity":
+            self._handle_cyclomatic_complexity()
         elif self.path == "/health":
             self._json_response(200, {"status": "ok"})
         else:
@@ -2273,6 +2327,37 @@ class V3Handler(BaseHTTPRequestHandler):
             )
         else:
             print(f"  [ast_edit] FAIL path={path} selector={selector!r}: {result['error']}", flush=True)
+        self._json_response(200, result)
+
+    def _handle_cyclomatic_complexity(self):
+        """POST /internal/cyclomatic_complexity — McCabe CC for tier classification.
+
+        Request:  {"path": "...", "source": "<full file content>"}
+        Response: {"ok": true, "language": "python", "cyclomatic_complexity": 12}
+                  or {"ok": false, "error": "..."}
+        """
+        content_len = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(content_len) or b"{}")
+        except json.JSONDecodeError as e:
+            self._json_response(400, {"ok": False, "error": f"invalid JSON body: {e}"})
+            return
+
+        path = body.get("path", "")
+        source_text = body.get("source", "")
+        if not path or source_text == "":
+            self._json_response(400, {"ok": False, "error": "missing required field(s): path, source"})
+            return
+
+        result = cyclomatic_complexity(path, source_text)
+        # Per-call signal — same pattern as ast_edit. Lets us correlate
+        # tier upgrades to the file that triggered them in docker logs.
+        if result.get("ok"):
+            print(
+                f"  [cc] {result['language']} {path} cc={result['cyclomatic_complexity']}",
+                flush=True,
+            )
+        # Don't log the not-supported case — it'd flood the log on every HTML/JSON write.
         self._json_response(200, result)
 
     def _json_response(self, code, data):

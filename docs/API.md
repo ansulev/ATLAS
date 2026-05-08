@@ -407,6 +407,65 @@ The final `event: result` payload has the shape:
 
 If all candidates fail to parse, the endpoint returns a single-step fallback (`{steps:[{action:"investigate the request and act"}], verify_step:null, winning_index:-1}`) rather than 5xx — callers can detect the fallback by `winning_index<0` or `reasons` containing "all candidates failed".
 
+### POST /internal/ast_edit
+
+GH #39 v1 — friendly-selector AST node replacement. Stateless transform: caller provides the file's source bytes, server parses with tree-sitter, finds the named node, returns the new full file content. The proxy reads + writes; this endpoint never touches the filesystem.
+
+**Request:**
+```json
+{
+  "path": "app.py",
+  "source": "<full current file content>",
+  "selector": "function:dashboard",
+  "content": "@app.route('/dashboard')\ndef dashboard():\n    return render_template('dashboard.html')"
+}
+```
+
+**Selectors v1:**
+- Python: `function:NAME`, `class:NAME` — decorator-aware (replaces the `decorated_definition` wrapper when present so `@app.route(...)` lines get included in the swap)
+- HTML: `<tag>` — top-level tag-name match (e.g. `<body>`, `<head>`, `<h1>`)
+
+**Response (success):**
+```json
+{
+  "success": true,
+  "language": "python",
+  "selector": "function:dashboard",
+  "new_content": "<full new file>",
+  "byte_range": [662, 881],
+  "old_size": 960,
+  "new_size": 852
+}
+```
+
+**Response (failure):**
+```json
+{"success": false, "error": "selector 'function:foo' matched 0 nodes in app.py. Verify the symbol exists — read the file first if unsure."}
+```
+
+Hard rule: selector must match exactly one node. Ambiguous selectors fail with a clear error so the caller can be more specific instead of silently rewriting the wrong function.
+
+### POST /internal/cyclomatic_complexity
+
+GH #39 point 2 — McCabe cyclomatic complexity from tree-sitter AST traversal. Used by the proxy's `classifyFileTier` to *escalate* (never downgrade) the regex-based tier verdict when real branching complexity warrants the V3 pipeline.
+
+**Request:**
+```json
+{"path": "app.py", "source": "<full file content>"}
+```
+
+**Response (success):**
+```json
+{"ok": true, "language": "python", "cyclomatic_complexity": 12}
+```
+
+**Response (unsupported / parse failed):**
+```json
+{"ok": false, "error": "cyclomatic_complexity v1 supports .py only (got index.html)"}
+```
+
+v1 supports Python only. Decision points counted: `if`/`elif`, `for`, `while`, `except`, `and`/`or` (short-circuit), ternary `x if cond else y`, `case` (match), and `if` filter clauses inside comprehensions.
+
 ### GET /health
 
 ```bash

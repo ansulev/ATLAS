@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -445,6 +446,16 @@ func writeFileTool() *ToolDef {
 
 			// Per-file tier classification — determines V3 pipeline activation
 			fileTier := classifyFileTier(input.Path, input.Content)
+			// GH #39 point 2: real cyclomatic complexity from tree-sitter
+			// can escalate the regex classifier's verdict. Never downgrades.
+			if cc, ok := cyclomaticComplexity(ctx, input.Path, input.Content); ok {
+				if refined := refineTierWithCC(fileTier, cc); refined != fileTier {
+					log.Printf("[write_file] %s tier %s→%s via cc=%d", input.Path, fileTier, refined, cc)
+					fileTier = refined
+				} else {
+					log.Printf("[write_file] %s cc=%d (tier %s unchanged)", input.Path, cc, fileTier)
+				}
+			}
 			log.Printf("[write_file] %s → %s (%d lines)", input.Path, fileTier, strings.Count(input.Content, "\n")+1)
 
 			// V3 pipeline fires on T2+ files when V3 service is available.
@@ -799,6 +810,15 @@ func editFileTool() *ToolDef {
 			// build-verify better, V3 wins; otherwise the baseline (=our
 			// edit) wins. Either way the answer is build-verified.
 			fileTier := classifyFileTier(input.Path, newContent)
+			// GH #39 point 2: CC enrichment — same as write_file's path.
+			if cc, ok := cyclomaticComplexity(ctx, input.Path, newContent); ok {
+				if refined := refineTierWithCC(fileTier, cc); refined != fileTier {
+					log.Printf("[edit_file] %s tier %s→%s via cc=%d", input.Path, fileTier, refined, cc)
+					fileTier = refined
+				} else {
+					log.Printf("[edit_file] %s cc=%d (tier %s unchanged)", input.Path, cc, fileTier)
+				}
+			}
 			v3Out := V3EditMetadata{}
 			if fileTier >= Tier2Medium && ctx.V3URL != "" {
 				log.Printf("[edit_file] V3 pipeline activating for %s (file_tier=%d, req_tier=%d)", input.Path, fileTier, ctx.Tier)
@@ -1623,6 +1643,72 @@ func classifyFileTier(filePath, content string) Tier {
 
 	// Default: T1 for unknown extensions / pure markup we're not sure about.
 	return Tier1Simple
+}
+
+// cyclomaticComplexity calls v3-service /internal/cyclomatic_complexity.
+// Returns (cc, true) when the service computed a real number, (0, false)
+// for any failure mode (unsupported language, parse error, network down,
+// timeout). Fail-soft is intentional — the existing regex-based
+// hasLogicIndicators stays the floor; CC only adds signal when available.
+//
+// GH #39 point 2. v1 supports Python only; HTML/JSON/etc. fall through
+// to false here and the proxy uses the regex classifier.
+func cyclomaticComplexity(ctx *AgentContext, path, source string) (int, bool) {
+	if ctx == nil || ctx.V3URL == "" {
+		return 0, false
+	}
+	body, err := json.Marshal(map[string]interface{}{"path": path, "source": source})
+	if err != nil {
+		return 0, false
+	}
+	reqCtx, cancel := context.WithTimeout(ctx.Ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "POST",
+		ctx.V3URL+"/internal/cyclomatic_complexity", bytes.NewReader(body))
+	if err != nil {
+		return 0, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, false
+	}
+	var r struct {
+		OK bool `json:"ok"`
+		CC int  `json:"cyclomatic_complexity"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil || !r.OK {
+		return 0, false
+	}
+	return r.CC, true
+}
+
+// refineTierWithCC bumps an existing tier upward when McCabe CC reveals
+// more branching than the regex classifier could see. Never downgrades —
+// the regex classifier is the floor, CC only escalates.
+//
+// Thresholds:
+//   CC ≥ 16 → Tier3Hard  — definitely needs full V3 + best-of-K
+//   CC ≥  8 → Tier2Medium — moderate branching, V3 likely helps
+//   CC <  8 → leave base tier unchanged
+//
+// Calibrated against the snake/app.py family: a flask file with 8 routes
+// runs at CC≈9 (one branch per route) and the regex already classifies
+// it T2; a control-flow-heavy parser with nested ifs at CC≈18 should
+// jump to T3 even if the regex landed it at T2.
+func refineTierWithCC(base Tier, cc int) Tier {
+	if cc >= 16 && base < Tier3Hard {
+		return Tier3Hard
+	}
+	if cc >= 8 && base < Tier2Medium {
+		return Tier2Medium
+	}
+	return base
 }
 
 // hasLogicIndicators checks if content contains signs of real application logic
