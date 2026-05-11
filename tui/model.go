@@ -130,6 +130,13 @@ type tuiModel struct {
 	streamingLLM       bool
 	streamingLLMText   string
 	streamingLLMHeader string
+	// May 10 2026: reasoning_token events stream the model's thought
+	// process (Qwen3.5 reasoning_content) separately from llm_token
+	// content. We accumulate into a parallel buffer and render it
+	// inline with the streaming row so users can see what the model
+	// is thinking before it commits to a tool call. Cleared with
+	// streamingLLMText on llm_call_end.
+	streamingReasoningText string
 
 	// Prompt-eval progress. While llama-server is encoding the prompt
 	// (before the first decoded token arrives), the proxy polls /slots
@@ -947,6 +954,7 @@ func (m *tuiModel) appendChatEvent(ev chatEvent) {
 		})
 		m.streamingLLM = true
 		m.streamingLLMText = ""
+		m.streamingReasoningText = ""
 		m.promptProcessed = 0
 		m.promptTotal = p.PromptTokens
 		m.promptPct = 0
@@ -1012,13 +1020,35 @@ func (m *tuiModel) appendChatEvent(ev chatEvent) {
 		}
 		if json.Unmarshal(ev.Data, &p) == nil && p.Text != "" {
 			m.streamingLLMText += p.Text
-			body := m.streamingLLMHeader + "\n" +
-				formatStreamingLLM(m.streamingLLMText)
+			body := m.streamingLLMHeader + "\n"
+			if m.streamingReasoningText != "" {
+				body += "  ‹thinking› " + formatStreamingLLM(m.streamingReasoningText) + "\n"
+			}
+			body += formatStreamingLLM(m.streamingLLMText)
 			m.replaceLLMRow(body)
 			// Live context-utilization update: each llm_token delta is
 			// roughly 1 model token, so increment the gauge per event.
 			// Authoritative count replaces this on llm_call_end.
 			m.lastTurnTokens++
+		}
+
+	case "reasoning_token":
+		// May 10 2026: Qwen3.5 reasoning_content streamed alongside
+		// content. Accumulate into a parallel buffer and re-render the
+		// streaming row with a "‹thinking›" prefix so the user can see
+		// the model's thought process. Distinct from llm_token because
+		// reasoning is internal model state, not the JSON tool call.
+		var p struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(ev.Data, &p) == nil && p.Text != "" {
+			m.streamingReasoningText += p.Text
+			body := m.streamingLLMHeader + "\n" +
+				"  ‹thinking› " + formatStreamingLLM(m.streamingReasoningText)
+			if m.streamingLLMText != "" {
+				body += "\n" + formatStreamingLLM(m.streamingLLMText)
+			}
+			m.replaceLLMRow(body)
 		}
 
 	case "llm_call_end":
@@ -1050,6 +1080,7 @@ func (m *tuiModel) appendChatEvent(ev chatEvent) {
 		m.replaceLLMRow(body)
 		m.streamingLLM = false
 		m.streamingLLMText = ""
+		m.streamingReasoningText = ""
 		m.streamingLLMHeader = ""
 		// Track tokens for the stats line. Qwen3.5's usage.total_tokens
 		// is "prompt + completion of *this* call", which is the right

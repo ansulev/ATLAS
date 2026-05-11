@@ -308,23 +308,14 @@ func (m *tuiModel) handleSlash(input string) (consumed bool, cmd tea.Cmd, quit b
 		}
 		text := collectLastMessages(m.chat, n)
 		if text == "" {
-			m.chat = append(m.chat, chatMessage{
-				Role: roleSystem, Meta: "error",
-				Body: "/copy: no messages to copy yet.",
-			})
+			m.showToast("/copy: no messages to copy yet")
 			return true, nil, false
 		}
 		if err := copyToClipboard(text); err != nil {
-			m.chat = append(m.chat, chatMessage{
-				Role: roleSystem, Meta: "error",
-				Body: fmt.Sprintf("/copy: %v (no clipboard tool found — install xclip, wl-clipboard, or use a terminal copy)", err),
-			})
+			m.showToast(fmt.Sprintf("/copy failed: %v", err))
 			return true, nil, false
 		}
-		m.chat = append(m.chat, chatMessage{
-			Role: roleSystem, Meta: "copy",
-			Body: fmt.Sprintf("copied %d chars to clipboard.", len(text)),
-		})
+		m.showToast(fmt.Sprintf("✓ copied %d chars", len(text)))
 		return true, nil, false
 	}
 
