@@ -17,8 +17,23 @@ import (
 // LLM request. This schema is available for reference but not directly
 // passed to llama-server.
 func buildToolCallSchema() map[string]interface{} {
+	return buildToolCallSchemaForTools(nil)
+}
+
+// buildToolCallSchemaForTools is the same as buildToolCallSchema, but with
+// the named tools removed from the tool-name enum. Used by callLLMConstrained
+// to ban edit_file/write_file for a single decision step after a write_file
+// rejection on .py/.html (BiasBusters #3, May 2026 research synthesis).
+func buildToolCallSchemaForTools(excluded []string) map[string]interface{} {
+	excludeSet := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		excludeSet[name] = struct{}{}
+	}
 	toolNames := make([]interface{}, 0, len(toolRegistry))
 	for name := range toolRegistry {
+		if _, skip := excludeSet[name]; skip {
+			continue
+		}
 		toolNames = append(toolNames, name)
 	}
 
@@ -84,6 +99,14 @@ func buildToolCallSchemaJSON() string {
 	return string(b)
 }
 
+// buildToolCallSchemaJSONForTools returns the JSON-encoded schema with the
+// listed tools excluded from the tool-name enum.
+func buildToolCallSchemaJSONForTools(excluded []string) string {
+	schema := buildToolCallSchemaForTools(excluded)
+	b, _ := json.Marshal(schema)
+	return string(b)
+}
+
 // ---------------------------------------------------------------------------
 // GBNF Grammar fallback
 // ---------------------------------------------------------------------------
@@ -92,6 +115,22 @@ func buildToolCallSchemaJSON() string {
 // to the same tool_call/text/done union. Currently unused; kept as
 // reference in case json_object mode needs to be replaced with GBNF.
 func buildGBNFGrammar() string {
+	return buildGBNFGrammarForTools(nil)
+}
+
+// buildGBNFGrammarForTools is buildGBNFGrammar with the listed tools
+// removed from the tool-name production. May 2026 BiasBusters #2: when
+// the next step must NOT use edit_file (e.g. write_file just got rejected
+// on a .py/.html file >5 lines), llama-server enforces the restriction
+// at the token-decode level via the `grammar` parameter — descriptions
+// and system prompt rules can be ignored by the model, but the grammar
+// physically cannot emit the banned tool name.
+func buildGBNFGrammarForTools(excluded []string) string {
+	excludeSet := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		excludeSet[name] = struct{}{}
+	}
+
 	var sb strings.Builder
 
 	// Root: one of the three response types
@@ -100,6 +139,9 @@ func buildGBNFGrammar() string {
 	// Tool call
 	toolNames := make([]string, 0, len(toolRegistry))
 	for name := range toolRegistry {
+		if _, skip := excludeSet[name]; skip {
+			continue
+		}
 		toolNames = append(toolNames, fmt.Sprintf(`"\"%s\""`, name))
 	}
 
@@ -145,6 +187,20 @@ func buildGBNFGrammar() string {
 
 // buildToolDescriptions generates the tool documentation section of the system prompt.
 func buildToolDescriptions() string {
+	return buildToolDescriptionsExcluding(nil)
+}
+
+// buildToolDescriptionsExcluding generates the tool documentation section
+// with the listed tools removed entirely. Used for the per-step nudge
+// note when edit_file/write_file must be banned for a single decision.
+// The system prompt is built once per session and we don't rebuild it,
+// but this is reused inside buildStepAdvisoryNote() to remind the model
+// of the available palette without the banned tool present.
+func buildToolDescriptionsExcluding(excluded []string) string {
+	excludeSet := make(map[string]struct{}, len(excluded))
+	for _, name := range excluded {
+		excludeSet[name] = struct{}{}
+	}
 	var sb strings.Builder
 	sb.WriteString("## Available Tools\n\n")
 	sb.WriteString("You must respond with a JSON object in one of these formats:\n\n")
@@ -153,6 +209,9 @@ func buildToolDescriptions() string {
 	sb.WriteString("**Task complete:** `{\"type\":\"done\",\"summary\":\"<what you did>\"}`\n\n")
 
 	for _, tool := range allTools() {
+		if _, skip := excludeSet[tool.Name]; skip {
+			continue
+		}
 		sb.WriteString(fmt.Sprintf("### %s\n", tool.Name))
 		sb.WriteString(fmt.Sprintf("%s\n\n", tool.Description))
 		sb.WriteString("**Input:**\n```json\n")

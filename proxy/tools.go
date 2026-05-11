@@ -387,8 +387,10 @@ func listDirectoryTool() *ToolDef {
 
 func writeFileTool() *ToolDef {
 	return &ToolDef{
-		Name:        "write_file",
-		Description: "Write content to a file. Creates parent directories if needed. For existing files, prefer edit_file for small changes.",
+		Name: "write_file",
+		Description: "Create a NEW file from scratch. Creates parent directories if needed. " +
+			"DO NOT use to overwrite existing files — for existing files use ast_edit (whole function/class/element rewrite) or edit_file (≤10-line surgical change). " +
+			"If a write_file call is rejected because the path already exists, switch to ast_edit (whole-block rewrite) or edit_file (surgical change). DO NOT retry with edit_file simply because the file is large.",
 		InputSchema: WriteFileInput{},
 		ReadOnly:    false,
 		Destructive: true,
@@ -723,8 +725,11 @@ func writeFileWithV3(path, baselineContent string, ctx *AgentContext) (*ToolResu
 
 func editFileTool() *ToolDef {
 	return &ToolDef{
-		Name:        "edit_file",
-		Description: "Edit a file by replacing an exact string with new content. The old_str must match exactly once in the file (unless replace_all is true). Always read_file before editing.",
+		Name: "edit_file",
+		Description: "SURGICAL inline string replacement, ONLY. Use ONLY when changing a few lines inside a function (a None check, a regex, a constant). " +
+			"DO NOT use for whole-function rewrites, whole-class rewrites, whole-file replacements, or any change >10 lines — for those, use ast_edit (named node) or write_file (new file). " +
+			"old_str must match exactly once (or replace_all=true). Always read_file before editing. " +
+			"Heuristic: if you're tempted to copy a whole function/class/HTML element into old_str, you have the wrong tool — switch to ast_edit.",
 		InputSchema: EditFileInput{},
 		ReadOnly:    false,
 		Destructive: false,
@@ -845,6 +850,18 @@ func editFileTool() *ToolDef {
 				newContent = strings.Replace(content, actualOldStr, input.NewStr, 1)
 			}
 
+			// Shrinkage guard — same shape as ast_edit's. Catches the
+			// "model emitted a stub for old_str" failure where new_str
+			// is implausibly tiny for a substantial old_str. We compare
+			// the local replacement footprint (old_str → new_str), not
+			// whole-file size, so refactors that genuinely shrink the
+			// file aren't false-rejected.
+			if rejection := validateNotSuspiciouslyShrunk("edit_file", input.Path, len(actualOldStr), len(input.NewStr)); rejection != "" {
+				log.Printf("[edit_file] rejecting suspicious shrinkage: %s old_str=%dB new_str=%dB",
+					input.Path, len(actualOldStr), len(input.NewStr))
+				return &ToolResult{Success: false, Error: rejection}, nil
+			}
+
 			// Route through V3 pipeline when the file warrants it. The
 			// gate now mirrors write_file (file-tier only, no request-tier
 			// AND-gate) — having two separate tier checks meant V3 only
@@ -853,14 +870,25 @@ func editFileTool() *ToolDef {
 			// baseline candidate #0; if its diverse alternatives
 			// build-verify better, V3 wins; otherwise the baseline (=our
 			// edit) wins. Either way the answer is build-verified.
-			fileTier := classifyFileTier(input.Path, newContent)
+			//
+			// May 10 2026: classify on max(oldTier, newTier) so a
+			// destructive edit that shrinks a T2+ file into a T1 stub
+			// still triggers V3. Without max-tier, the very edits that
+			// most need quality-checking were silently bypassing the
+			// pipeline because their output was too small to qualify.
+			oldTier := classifyFileTier(input.Path, content)
+			newTier := classifyFileTier(input.Path, newContent)
+			fileTier := oldTier
+			if newTier > fileTier {
+				fileTier = newTier
+			}
 			// GH #39 point 2: CC enrichment — same as write_file's path.
 			if cc, ok := cyclomaticComplexity(ctx, input.Path, newContent); ok {
 				if refined := refineTierWithCC(fileTier, cc); refined != fileTier {
 					log.Printf("[edit_file] %s tier %s→%s via cc=%d", input.Path, fileTier, refined, cc)
 					fileTier = refined
 				} else {
-					log.Printf("[edit_file] %s cc=%d (tier %s unchanged)", input.Path, cc, fileTier)
+					log.Printf("[edit_file] %s cc=%d (tier %s unchanged, oldTier=%d newTier=%d)", input.Path, cc, fileTier, oldTier, newTier)
 				}
 			}
 			v3Out := V3EditMetadata{}
@@ -933,11 +961,11 @@ func editFileTool() *ToolDef {
 func astEditTool() *ToolDef {
 	return &ToolDef{
 		Name: "ast_edit",
-		Description: "Replace a named AST node (function, class, HTML element) with new content. " +
-			"Selectors v1: python `function:NAME` or `class:NAME` (decorators included automatically); " +
-			"html `<tag>` (top-level element). Selector must match exactly one node — failures return " +
-			"actionable errors. Prefer this over edit_file for whole-function or whole-element rewrites: " +
-			"no need to regurgitate the existing content as old_str.",
+		Description: "REQUIRED tool for whole-function, whole-class, or whole-HTML-element rewrites in existing files. " +
+			"ALWAYS prefer over edit_file when replacing a named node or changing more than ~10 lines — edit_file is the WRONG tool for those cases (it forces you to copy the entire existing block as old_str, wasting tokens and frequently truncating). " +
+			"Selectors v1: python `function:NAME` or `class:NAME` (decorators included automatically); html `<tag>` (top-level element). " +
+			"Selector must match exactly one node; failures return actionable errors. " +
+			"Decision rule: existing file + named-node change (any size) ⇒ ast_edit. New file ⇒ write_file. ≤10 lines inside a function ⇒ edit_file.",
 		InputSchema: AstEditInput{},
 		ReadOnly:    false,
 		Destructive: false,
@@ -978,6 +1006,24 @@ func astEditTool() *ToolDef {
 			if cleaned, sanitized := sanitizeFileContent(input.Path, input.Content); sanitized {
 				log.Printf("[ast_edit] sanitised markdown wrapper from content of %s", input.Path)
 				input.Content = cleaned
+			}
+
+			// HTML <html>-selector quirk. ast_edit replaces only the
+			// <html>...</html> element, NOT the preceding <!DOCTYPE>
+			// declaration that conventionally precedes it. The model
+			// frequently emits a leading <!DOCTYPE html> at the top of
+			// `content` when selector is <html>, which produces a duplicated
+			// doctype on disk (May 8 2026 flask test: dashboard.html
+			// ended up with two consecutive <!DOCTYPE html> lines after
+			// a successful ast_edit). Detect that shape and strip the
+			// leading doctype line so on-disk output matches intent.
+			ext := strings.ToLower(filepath.Ext(input.Path))
+			isHTML := ext == ".html" || ext == ".htm"
+			if isHTML && strings.EqualFold(strings.TrimSpace(input.Selector), "<html>") {
+				if stripped, ok := stripLeadingDoctype(input.Content); ok {
+					log.Printf("[ast_edit] stripped leading <!DOCTYPE> from content of %s — selector <html> only replaces the html element, not the preceding doctype", input.Path)
+					input.Content = stripped
+				}
 			}
 
 			// Call v3-service /internal/ast_edit. Stateless transform:
@@ -1023,29 +1069,97 @@ func astEditTool() *ToolDef {
 				return &ToolResult{Success: false, Error: astResp.Error}, nil
 			}
 
+			// Shrinkage guard — catch the May 9 2026 destructive-stub bug
+			// where the model emits only "<!DOCTYPE html>\n" for an entire
+			// <html>-element rewrite. astResp.OldSize is the original
+			// node's bytes; astResp.NewSize is the replacement bytes. If
+			// the replacement is suspiciously small for the original,
+			// reject the write and tell the model to re-emit with the
+			// full body.
+			if rejection := validateNotSuspiciouslyShrunk("ast_edit", input.Path, astResp.OldSize, astResp.NewSize); rejection != "" {
+				log.Printf("[ast_edit] rejecting suspicious shrinkage: %s old=%dB new=%dB selector=%q",
+					input.Path, astResp.OldSize, astResp.NewSize, input.Selector)
+				return &ToolResult{Success: false, Error: rejection}, nil
+			}
+
+			// V3 quality-gate routing. Two May 10 2026 corrections to the
+			// May 9 v1:
+			//   (a) Tier classification used post-edit content only. When
+			//       ast_edit produced a destructive stub (32B), tier
+			//       classified as T1 and V3 skipped the very edits that
+			//       most needed quality-checking. Switched to
+			//       max(oldTier, newTier) so destructive edits to T2+
+			//       originals always trigger V3.
+			//   (b) Even with the max-tier fix, the Tier2Medium floor
+			//       made V3 too rare. Lead requested V3 fire on
+			//       essentially every ast_edit emit — drop the floor
+			//       entirely for ast_edit when V3URL is configured.
+			//       T1 ast_edits run V3 too; only when V3URL is empty
+			//       does ast_edit ship its result without quality gating.
+			//
+			// Baseline candidate is the AST-edited full file. V3's
+			// alternatives compete against it; if one build-verifies
+			// better, V3 wins; otherwise the AST-edited content passes
+			// through unchanged. Either way the answer is build-verified.
+			finalContent := astResp.NewContent
+			v3Out := V3EditMetadata{}
+			oldTier := classifyFileTier(input.Path, source) // pre-edit content
+			newTier := classifyFileTier(input.Path, finalContent)
+			fileTier := oldTier
+			if newTier > fileTier {
+				fileTier = newTier
+			}
+			if cc, ok := cyclomaticComplexity(ctx, input.Path, finalContent); ok {
+				if refined := refineTierWithCC(fileTier, cc); refined != fileTier {
+					log.Printf("[ast_edit] %s tier %s→%s via cc=%d", input.Path, fileTier, refined, cc)
+					fileTier = refined
+				}
+			}
+			if ctx.V3URL != "" {
+				log.Printf("[ast_edit] V3 pipeline activating for %s (oldTier=%d newTier=%d max=%d, req_tier=%d) post-AST-edit", input.Path, oldTier, newTier, fileTier, ctx.Tier)
+				improved, meta, err := improveContentWithV3(path, finalContent, ctx)
+				if err != nil {
+					log.Printf("[ast_edit] V3 failed: %v — falling back to AST-edited content", err)
+				} else if improved != "" {
+					if cleanedImproved, sanitized := sanitizeFileContent(input.Path, improved); sanitized {
+						log.Printf("[ast_edit] sanitised V3 output for %s", input.Path)
+						improved = cleanedImproved
+					}
+					finalContent = improved
+					v3Out = meta
+				}
+			}
+
 			// Atomic write — same pattern as edit_file/write_file.
 			tmpPath := path + ".atlas.tmp"
-			if err := os.WriteFile(tmpPath, []byte(astResp.NewContent), 0644); err != nil {
+			if err := os.WriteFile(tmpPath, []byte(finalContent), 0644); err != nil {
 				return nil, fmt.Errorf("cannot write %s: %w", input.Path, err)
 			}
 			if err := os.Rename(tmpPath, path); err != nil {
 				os.Remove(tmpPath)
 				return nil, fmt.Errorf("cannot rename temp file: %w", err)
 			}
-			ctx.RecordFileRead(path, astResp.NewContent)
+			ctx.RecordFileRead(path, finalContent)
 
-			log.Printf("[ast_edit] %s %s selector=%q lang=%s old=%dB new=%dB",
-				input.Path, input.Selector, input.Selector, astResp.Language, astResp.OldSize, astResp.NewSize)
+			log.Printf("[ast_edit] %s %s selector=%q lang=%s old=%dB new=%dB v3=%v",
+				input.Path, input.Selector, input.Selector, astResp.Language, astResp.OldSize, len(finalContent), v3Out.Used)
 
 			out := AstEditOutput{
 				OK:       true,
 				Selector: input.Selector,
 				Language: astResp.Language,
 				BytesOld: astResp.OldSize,
-				BytesNew: astResp.NewSize,
+				BytesNew: len(finalContent),
 			}
 			outBytes, _ := json.Marshal(out)
-			return &ToolResult{Success: true, Data: outBytes}, nil
+			result := &ToolResult{Success: true, Data: outBytes}
+			if v3Out.Used {
+				result.V3Used = true
+				result.CandidatesTested = v3Out.CandidatesTested
+				result.WinningScore = v3Out.WinningScore
+				result.PhaseSolved = v3Out.PhaseSolved
+			}
+			return result, nil
 		},
 	}
 }

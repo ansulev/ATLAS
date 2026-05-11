@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -37,7 +36,11 @@ func callV3GenerateStreaming(v3URL string, req V3GenerateRequest, onProgress V3P
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Minute}
+	// May 10 2026: timeout removed. V3 pipelines can run >15 min when
+	// they hit Phase 3 repair on a difficult edit; capping the call
+	// killed otherwise-working runs. Cancellation via request context
+	// still works for user-initiated aborts.
+	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("V3 service call failed: %w", err)
@@ -119,7 +122,11 @@ func callV3PlanStreaming(v3URL string, req V3PlanRequest, onProgress V3ProgressF
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Minute}
+	// May 10 2026: timeout removed (was 5 min). Plan generation can run
+	// long on multi-candidate scoring; bounding it via the client
+	// timeout killed slow-but-progressing calls. Request context
+	// cancellation still works.
+	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("plan call failed: %w", err)

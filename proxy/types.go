@@ -16,15 +16,20 @@ import (
 
 // TierMaxTurns returns the maximum agent loop iterations for this tier.
 //
-// PC-200 — caps raised from T2:30/T3:60 to T2:60/T3:100. Real fix-many-bugs
-// runs hit the old limits before the model could finish (May 6 18:20: model
-// declared done at turn 11 with 5 of 8 routes still 500 — not because of
-// the cap, but the cap removed the runway to retry after the strengthened
-// claim-check bounces).
+// May 10 2026: cap removed entirely for tool-using tiers (T1/T2/T3). The
+// 8 stuck-pattern detectors (parse-error / tool-repeat / reasoning-repeat
+// / lens-regression / exploration-budget / path-aware error-loop /
+// action gate / verification gate) are the real safety net; a numeric
+// turn cap was insurance against unknown failure modes the detectors
+// might miss, but it bit legitimate multi-file long-form work harder
+// than it ever caught a real runaway. User-initiated cancellation
+// (ctx.Ctx) still works as the upper bound. T0 keeps a small cap as
+// a SHAPE constraint (conversational input shouldn't loop) — not a
+// runaway-protection.
 //
-// Override via ATLAS_MAX_TURNS env (any positive int wins; 0 = uncapped
-// up to absoluteMaxTurns; see envOverrideMaxTurns).
-const absoluteMaxTurns = 200 // hard wall to prevent stuck-model runaway
+// MaxTurns == 0 is the agent-loop's "uncapped" sentinel. Override via
+// ATLAS_MAX_TURNS env (any positive int caps; setting unset / 0 →
+// uncapped).
 
 func TierMaxTurns(t Tier) int {
 	if n := envOverrideMaxTurns(); n > 0 {
@@ -33,20 +38,15 @@ func TierMaxTurns(t Tier) int {
 	switch t {
 	case Tier0Conversational:
 		return 5
-	case Tier1Simple:
-		return 30
-	case Tier2Medium:
-		return 60
-	case Tier3Hard:
-		return 100
+	case Tier1Simple, Tier2Medium, Tier3Hard:
+		return 0 // uncapped
 	}
-	return 60
+	return 0
 }
 
 // envOverrideMaxTurns reads ATLAS_MAX_TURNS. Returns:
-//   - n > 0  → use n (capped at absoluteMaxTurns)
-//   - n == 0 → use absoluteMaxTurns (effectively "uncapped")
-//   - unset / invalid → 0 (caller falls through to tier defaults)
+//   - n > 0  → use n (no upper cap — operator's call)
+//   - n == 0 / unset / invalid → 0 (caller falls through to tier defaults)
 func envOverrideMaxTurns() int {
 	raw := os.Getenv("ATLAS_MAX_TURNS")
 	if raw == "" {
@@ -55,9 +55,6 @@ func envOverrideMaxTurns() int {
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 0 {
 		return 0
-	}
-	if n == 0 || n > absoluteMaxTurns {
-		return absoluteMaxTurns
 	}
 	return n
 }
@@ -413,6 +410,25 @@ type AgentContext struct {
 	// entries, the loop injects a corrective system message. See
 	// proxy/tool_repeat.go for the detection logic.
 	RecentToolCalls []string
+
+	// Reasoning-repetition detector state (May 10 2026, BiasBusters
+	// follow-up #30). Per-turn snapshot of the model's reasoning_content
+	// stream. When the same opening prose ("Now I need to look at the
+	// file" / similar) appears across consecutive turns, the loop
+	// injects a corrective so the model breaks out of the thought loop.
+	// See proxy/reasoning_repeat.go for the detection logic.
+	LastTurnReasoning           string
+	LastReasoningSnippet        string
+	ConsecutiveReasoningRepeats int
+
+	// Path-aware error-loop detector (May 10 2026). Tracks recent
+	// failure paths so the 3-consecutive-failures breaker can
+	// distinguish "stuck on one file" (real loop, stop) from
+	// "grinding through different files, some succeed, some fail"
+	// (progress, keep going). Cleared on any successful tool result.
+	// See proxy/agent.go error-loop break for the use site.
+	RecentFailurePaths []string
+
 	mu           sync.Mutex
 
 	// Plan is the optional pre-flight plan produced by /v3/plan. Set

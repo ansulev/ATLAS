@@ -135,6 +135,34 @@ func extractScorableContent(toolName string, args json.RawMessage) (string, bool
 	return "", false
 }
 
+// extractFailurePath returns the path argument of a tool call when
+// the tool operates on a file (read/write/edit/ast_edit/delete/
+// search/list/find/run_background's cwd). Used by the path-aware
+// error-loop breaker to distinguish "stuck on one file" from
+// "grinding through different files." Returns "" when no path is
+// applicable to the tool (e.g. plan_tasks, run_command's arbitrary
+// shell) — empty paths compare unequal, which prevents the breaker
+// from firing on tool-mix sequences.
+func extractFailurePath(toolName string, args json.RawMessage) string {
+	switch toolName {
+	case "read_file", "write_file", "edit_file", "ast_edit", "delete_file", "find_file":
+		var p struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(args, &p); err == nil {
+			return p.Path
+		}
+	case "list_directory", "search_files":
+		var p struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(args, &p); err == nil {
+			return p.Path
+		}
+	}
+	return ""
+}
+
 // agentLensRegression returns the corrective message to inject (and true)
 // when the recent agent-loop scoring history shows a quality crash
 // pattern. Returns ("", false) when no intervention is warranted.

@@ -187,12 +187,13 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 	// crossing the threshold.
 	budgetHintFired := false
 
-	for turn := 0; turn < ctx.MaxTurns; turn++ {
-		// PC-200 — at 80% of the turn cap, inject a one-time tool-result
-		// hint nudging the model to wrap up rather than getting stuck in
-		// recon mid-job. Goes via Messages so it lands in the next LLM
-		// prompt as a system note, not a user message.
-		if !budgetHintFired && turn > 0 && turn*5 >= ctx.MaxTurns*4 {
+	for turn := 0; ctx.MaxTurns <= 0 || turn < ctx.MaxTurns; turn++ {
+		// PC-200 budget hint — only relevant when there IS a turn cap.
+		// May 10 2026: T1/T2/T3 default to uncapped (ctx.MaxTurns == 0),
+		// so the hint is mostly dormant unless an operator explicitly
+		// sets ATLAS_MAX_TURNS. T0 still hits a hint at turn 4 if a
+		// conversational request unexpectedly tries to loop.
+		if !budgetHintFired && ctx.MaxTurns > 0 && turn > 0 && turn*5 >= ctx.MaxTurns*4 {
 			budgetHintFired = true
 			ctx.Messages = append(ctx.Messages, AgentMessage{
 				Role: "system",
@@ -383,6 +384,34 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 					Content:    fmt.Sprintf(`{"success":false,"error":%q}`, rejection),
 					ToolCallID: fmt.Sprintf("call_%d", turn),
 					ToolName:   "verification_gate",
+				})
+				continue
+			}
+
+			// Done-without-action gate. May 10 2026 false-success: model
+			// spent 6 turns starting servers + curling and never actually
+			// edited the file the user asked to rewrite, then declared
+			// done. Existing fix-intent gate didn't catch it because
+			// "rewrite" is action-intent, not fix-intent. This gate
+			// bounces `done` when the user prompt clearly asks for a
+			// state change AND no productive write/edit/ast_edit/delete
+			// landed in the loop. Distinct from verification gate:
+			// - verification gate: fix prompt + no run_command verify → bounce
+			// - this gate: action prompt + no successful edit tool → bounce
+			// Both can fire on the same prompt (e.g. "rewrite X and verify").
+			if isActionIntentMessage(userMessage) && !madeProductiveChange && !ctx.YoloMode {
+				rejection := actionWithoutProductiveChangeMessage(userMessage)
+				log.Printf("[agent] done-without-action gate: bouncing done at turn %d (user prompt %q has action-intent, no successful write/edit/ast_edit this loop)",
+					turn, truncateStr(userMessage, 60))
+				ctx.Messages = append(ctx.Messages, AgentMessage{
+					Role:    "assistant",
+					Content: response,
+				})
+				ctx.Messages = append(ctx.Messages, AgentMessage{
+					Role:       "tool",
+					Content:    fmt.Sprintf(`{"success":false,"error":%q}`, rejection),
+					ToolCallID: fmt.Sprintf("call_%d", turn),
+					ToolName:   "action_gate",
 				})
 				continue
 			}
@@ -585,7 +614,7 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			if parsed.Name == "run_command" && !ctx.YoloMode {
 				var rc RunCommandInput
 				if json.Unmarshal(parsed.Args, &rc) == nil {
-					if rejection := validateShellCommand(rc.Command); rejection != "" {
+					if rejection := validateRunCommand(rc.Command, ctx.WorkingDir); rejection != "" {
 						log.Printf("[agent] rejecting run_command %q: %s",
 							truncateStr(rc.Command, 80), rejection)
 						ctx.Messages = append(ctx.Messages, AgentMessage{
@@ -597,6 +626,36 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 							Content:    fmt.Sprintf(`{"success":false,"error":%q}`, rejection),
 							ToolCallID: fmt.Sprintf("call_%d", turn),
 							ToolName:   "run_command",
+						})
+						continue
+					}
+				}
+			}
+
+			// Same shell-validation + working-dir gate for run_background.
+			// Without this, the May 8 2026 phantom-/workspace drift went
+			// unblocked: the surgical-edit gate covered run_command but
+			// run_background sailed through, so `run_background "cd
+			// /workspace && python app.py"` looped for 3 turns before the
+			// repeat detector caught it. validateRunCommand chains both
+			// gates so destructive shell verbs and /workspace drift get
+			// the same treatment regardless of which run_* tool the model
+			// picks.
+			if parsed.Name == "run_background" && !ctx.YoloMode {
+				var rb RunBackgroundInput
+				if json.Unmarshal(parsed.Args, &rb) == nil {
+					if rejection := validateRunCommand(rb.Command, ctx.WorkingDir); rejection != "" {
+						log.Printf("[agent] rejecting run_background %q: %s",
+							truncateStr(rb.Command, 80), rejection)
+						ctx.Messages = append(ctx.Messages, AgentMessage{
+							Role:    "assistant",
+							Content: response,
+						})
+						ctx.Messages = append(ctx.Messages, AgentMessage{
+							Role:       "tool",
+							Content:    fmt.Sprintf(`{"success":false,"error":%q}`, rejection),
+							ToolCallID: fmt.Sprintf("call_%d", turn),
+							ToolName:   "run_background",
 						})
 						continue
 					}
@@ -621,6 +680,30 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				})
 				pendingRepeatCorrective = msg
 				ctx.RecentToolCalls = nil // reset so we don't re-fire
+			}
+
+			// Reasoning-repetition detector (BiasBusters #30). The
+			// model's reasoning_content stream is captured per-turn in
+			// ctx.LastTurnReasoning by callLLMOnce. recordReasoning
+			// compares the normalized opening prefix against the prior
+			// turn's snippet; ≥2 consecutive identical openings fires
+			// the intervention. Sibling to the structural repeat
+			// detector (above) and the lens regression detector (below)
+			// — three different angles on "model is stuck", catching
+			// different shapes of stuck-ness.
+			pendingReasoningCorrective := ""
+			if msg, repeating := recordReasoning(ctx, ctx.LastTurnReasoning); repeating {
+				log.Printf("[agent] reasoning repetition at turn %d (consecutive=%d) — queuing corrective", turn, ctx.ConsecutiveReasoningRepeats+1)
+				ctx.Stream("agent_reasoning_intervention", map[string]interface{}{
+					"turn":                  turn,
+					"consecutive":           ctx.ConsecutiveReasoningRepeats + 1,
+					"reason":                msg,
+					"snippet":               ctx.LastReasoningSnippet,
+				})
+				pendingReasoningCorrective = msg
+				// Reset so we don't re-fire on the same loop.
+				ctx.ConsecutiveReasoningRepeats = 0
+				ctx.LastReasoningSnippet = ""
 			}
 
 			// PC-207 agent-loop integration: score write_file/edit_file
@@ -707,8 +790,14 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			}
 
 			// Track productive state changes — write/edit/delete that landed.
-			// Used below to soften the error-loop exit when work was completed.
-			if result.Success && (parsed.Name == "write_file" || parsed.Name == "edit_file" || parsed.Name == "delete_file") {
+			// Used below to soften the error-loop exit when work was completed
+			// AND by the done-without-action gate so a feature prompt
+			// ("rewrite X", "add Y") can't declare done without any actual
+			// edit on disk. ast_edit was missing from this list pre-May-10,
+			// which let an ast_edit-only success path slip past the
+			// productive-change tracking too.
+			if result.Success && (parsed.Name == "write_file" || parsed.Name == "edit_file" ||
+				parsed.Name == "ast_edit" || parsed.Name == "delete_file") {
 				madeProductiveChange = true
 			}
 
@@ -745,24 +834,44 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 			// be too large to modify" when their file is, in fact, on disk.
 			if !result.Success {
 				consecutiveErrors++
+				// May 10 2026: path-aware breaker. Track which file each
+				// failure was on; only escalate when 3 consecutive failures
+				// share the same path (= truly stuck on one file). 3 fails
+				// across DIFFERENT files = grinding through multi-file work,
+				// keep going.
+				failPath := extractFailurePath(parsed.Name, parsed.Args)
+				ctx.RecentFailurePaths = append(ctx.RecentFailurePaths, failPath)
+				if len(ctx.RecentFailurePaths) > 3 {
+					ctx.RecentFailurePaths = ctx.RecentFailurePaths[len(ctx.RecentFailurePaths)-3:]
+				}
 				if consecutiveErrors >= 3 {
-					log.Printf("[agent] breaking error loop: %d consecutive failures at turn %d (productive=%v)", consecutiveErrors, turn, madeProductiveChange)
-					if madeProductiveChange {
-						ctx.Stream("done", map[string]string{"summary": "Wrote your changes to disk; couldn't verify them automatically (the verification commands failed). Run them yourself to confirm — they're on disk."})
+					samePath := len(ctx.RecentFailurePaths) == 3 &&
+						ctx.RecentFailurePaths[0] != "" &&
+						ctx.RecentFailurePaths[0] == ctx.RecentFailurePaths[1] &&
+						ctx.RecentFailurePaths[1] == ctx.RecentFailurePaths[2]
+					if !samePath {
+						log.Printf("[agent] path-aware breaker: %d consecutive failures across different paths (%v) — continuing, not a stuck loop", consecutiveErrors, ctx.RecentFailurePaths)
+						// Reset consecutiveErrors so the multi-file grind
+						// can keep going. The recent-paths list stays as
+						// a rolling window so if subsequent fails DO
+						// collapse onto one path, we still catch it.
+						consecutiveErrors = 0
 					} else {
-						// Non-productive 3-error exit. The previous message
-						// ("file may be too large") presumed a write/edit
-						// context, but this branch fires for any 3 failures
-						// — including discovery flailing (empty paths from
-						// PC-039, missing files, bad regex). Be honest about
-						// the failure mode and point at the tool errors so
-						// the user can correct course.
-						ctx.Stream("done", map[string]string{"summary": "Stopped after 3 tool failures with no successful changes. Common causes: the file you referenced isn't in the workspace, an empty path argument was passed, or a regex was malformed. Check the per-turn errors above, then try a more specific request (e.g. \"fix snake_game.py at line 95 — the curses bounds are wrong\")."})
+						log.Printf("[agent] breaking error loop: %d consecutive failures on the same path %q at turn %d (productive=%v)",
+							consecutiveErrors, ctx.RecentFailurePaths[0], turn, madeProductiveChange)
+						if madeProductiveChange {
+							ctx.Stream("done", map[string]string{"summary": "Wrote your changes to disk; couldn't verify them automatically (the verification commands failed). Run them yourself to confirm — they're on disk."})
+						} else {
+							ctx.Stream("done", map[string]string{"summary": "Stopped after 3 tool failures on the same target with no successful changes. Common causes: the file you referenced isn't in the workspace, an empty path argument was passed, or a regex was malformed. Check the per-turn errors above, then try a more specific request (e.g. \"fix snake_game.py at line 95 — the curses bounds are wrong\")."})
+						}
+						return nil
 					}
-					return nil
 				}
 			} else {
 				consecutiveErrors = 0
+				// Successful tool call resets the path window — the model
+				// is clearly making progress somewhere.
+				ctx.RecentFailurePaths = nil
 			}
 
 			// Track consecutive read-only calls to detect exploration loops
@@ -808,6 +917,17 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 				ctx.Messages = append(ctx.Messages, AgentMessage{
 					Role:    "user",
 					Content: "[system note]: " + pendingRepeatCorrective,
+				})
+			}
+			// Reasoning-repetition intervention. Same shape as the two
+			// above — appended after the tool result so the next LLM
+			// call sees: assistant(tool_call) → tool(result) → user
+			// (reasoning warning). Stacks with the others when multiple
+			// fire; the model gets all three signals.
+			if pendingReasoningCorrective != "" {
+				ctx.Messages = append(ctx.Messages, AgentMessage{
+					Role:    "user",
+					Content: "[system note]: " + pendingReasoningCorrective,
 				})
 			}
 
@@ -879,8 +999,20 @@ func runAgentLoop(ctx *AgentContext, userMessage string) error {
 // nudge appended to the messages. This avoids burning a full agent-loop
 // turn (~30s + tokens) on the parse-error retry path. The nudge is
 // scoped to the retry call only; ctx.Messages is not mutated.
+//
+// May 2026 BiasBusters #2/#3 — per-step tool restriction. If the previous
+// turn ended in a write_file rejection on a .py/.html file >5 lines, the
+// model is biased toward retrying with edit_file (lexically closer to
+// write_file than ast_edit, despite ast_edit being correct for the case).
+// We respond by (a) dropping edit_file and write_file from the GBNF
+// tool-name production for this single decision and (b) injecting an
+// ephemeral [system note] reminding the model that ast_edit is the only
+// available structural-edit tool for this step. ctx.Messages is not
+// mutated; the nudge and grammar restriction are scoped to this call.
 func callLLMConstrained(ctx *AgentContext, schemaJSON string) (string, int, error) {
-	content, tokens, err := callLLMOnce(ctx, ctx.Messages, 0.3)
+	messages, grammar := buildStepRequest(ctx)
+
+	content, tokens, err := callLLMOnceWithGrammar(ctx, messages, 0.3, grammar)
 	if err != nil {
 		return "", tokens, err
 	}
@@ -893,17 +1025,129 @@ func callLLMConstrained(ctx *AgentContext, schemaJSON string) (string, int, erro
 	// next-action prompt; the temperature bump escapes the EOS-local
 	// minimum that the json_object grammar can wedge the model into.
 	log.Printf("[agent] empty LLM response (PC-043), retrying with temp=0.7 + continuation nudge")
-	nudged := append(append([]AgentMessage(nil), ctx.Messages...), AgentMessage{
+	nudged := append(append([]AgentMessage(nil), messages...), AgentMessage{
 		Role:    "user",
 		Content: `Continue. Respond with one JSON object: {"type":"tool_call","name":"<tool>","args":{...}} for the next action, or {"type":"done","summary":"..."} if the task is complete. Do not emit empty content.`,
 	})
-	content2, tokens2, err := callLLMOnce(ctx, nudged, 0.7)
+	content2, tokens2, err := callLLMOnceWithGrammar(ctx, nudged, 0.7, grammar)
 	if err != nil {
 		// Return whatever we have from the original call; caller
 		// handles empty via parse-error retry.
 		return content, tokens, nil
 	}
 	return content2, tokens + tokens2, nil
+}
+
+// buildStepRequest assembles the messages and grammar for the next LLM
+// call. In the common case it returns ctx.Messages and "" (no grammar
+// override). When the previous turn ended in a write_file rejection on a
+// .py/.html file, it returns ctx.Messages plus an ephemeral [system note]
+// user message AND a restricted GBNF grammar that excludes edit_file
+// and write_file from the tool-name production. See callLLMConstrained
+// docstring for the BiasBusters context.
+func buildStepRequest(ctx *AgentContext) ([]AgentMessage, string) {
+	// Plan-progress reminder. Always rendered when ctx.Plan exists;
+	// not persisted to ctx.Messages so it doesn't accumulate. Lands
+	// AT THE TAIL of the messages slice so the model sees it as the
+	// most-recent user-role input right before its next decision.
+	// May 10 2026 follow-up — long multi-file tasks were losing plan
+	// context after trim; per-turn injection makes the progress
+	// surface persistent without bloating history.
+	planReminder := buildPlanReminder(ctx)
+
+	excluded, ext := stepExclusions(ctx)
+	if len(excluded) == 0 {
+		if planReminder == "" {
+			return ctx.Messages, ""
+		}
+		messages := append(append([]AgentMessage(nil), ctx.Messages...), AgentMessage{
+			Role:    "user",
+			Content: planReminder,
+		})
+		return messages, ""
+	}
+
+	note := fmt.Sprintf(
+		"[system note]: For this single decision, %s is unavailable. The previous write_file was rejected because the target is an existing %s file >5 lines. Use ast_edit with a structural selector (function:NAME, class:NAME, or <tag>) to rewrite the named node. ast_edit doesn't need old_str so it doesn't truncate on long content. Emit exactly one JSON object: {\"type\":\"tool_call\",\"name\":\"ast_edit\",\"args\":{\"path\":\"...\",\"selector\":\"...\",\"content\":\"...\"}}.",
+		strings.Join(excluded, " and "),
+		strings.TrimPrefix(ext, "."),
+	)
+	messages := append([]AgentMessage(nil), ctx.Messages...)
+	if planReminder != "" {
+		messages = append(messages, AgentMessage{Role: "user", Content: planReminder})
+	}
+	messages = append(messages, AgentMessage{Role: "user", Content: note})
+
+	grammar := buildGBNFGrammarForTools(excluded)
+	log.Printf("[agent] step-restriction active: banning %v from tool-name enum (ext=%s) — BiasBusters #2/#3", excluded, ext)
+	return messages, grammar
+}
+
+// stepExclusions inspects the tail of ctx.Messages and returns the list
+// of tool names that must be banned for the next decision, plus the
+// triggering file extension. Returns nil/"" in the common case.
+//
+// Trigger: most recent tool-result message is from write_file with a
+// success=false body whose error mentions "already exists", and the
+// path being targeted has extension .py / .html / .htm. The window
+// scanned is the last 6 messages (assistant call + tool result + a few
+// recent siblings).
+func stepExclusions(ctx *AgentContext) ([]string, string) {
+	n := len(ctx.Messages)
+	if n == 0 {
+		return nil, ""
+	}
+	// Walk backwards over the recent tail. We only fire when the LAST
+	// tool message is a write_file rejection on .py/.html. If a fresh
+	// assistant turn has already happened (the model corrected itself),
+	// the tail will end in something other than that tool result and we
+	// return nil — the restriction expires after a single decision.
+	startIdx := n - 1
+	if startIdx > 6 {
+		startIdx = 6
+	}
+	for i := n - 1; i >= n-1-startIdx && i >= 0; i-- {
+		msg := ctx.Messages[i]
+		if msg.Role != "tool" {
+			// First non-tool message we encounter while walking back —
+			// stop. We don't want a stale rejection from 4 turns ago to
+			// keep firing.
+			if msg.Role == "user" && strings.HasPrefix(strings.TrimSpace(msg.Content), "[system note]:") {
+				continue
+			}
+			break
+		}
+		if msg.ToolName != "write_file" {
+			continue
+		}
+		if !strings.Contains(msg.Content, "already exists") {
+			continue
+		}
+		// Pull the path from the rejection text so we can sniff the ext.
+		// The rejection format (see surgical-edit gate) is:
+		//   "File <path> already exists (<n> lines). ..."
+		const pfx = "File "
+		s := msg.Content
+		idx := strings.Index(s, pfx)
+		if idx < 0 {
+			continue
+		}
+		s = s[idx+len(pfx):]
+		spaceIdx := strings.Index(s, " ")
+		if spaceIdx < 0 {
+			continue
+		}
+		path := s[:spaceIdx]
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".py" && ext != ".html" && ext != ".htm" {
+			return nil, ""
+		}
+		// Ban write_file (just got rejected) and edit_file (the wrong
+		// shortcut the model is biased toward). Leave ast_edit and the
+		// read/run/etc tools available.
+		return []string{"edit_file", "write_file"}, ext
+	}
+	return nil, ""
 }
 
 // eraseLlamaSlot clears llama.cpp's KV slot 0 to give the next chat
@@ -1067,11 +1311,21 @@ func probeSlot(ctx context.Context, client *http.Client, llamaURL string) (int, 
 // these legitimate calls. Bumped to 10 min: still bounds a truly hung
 // llama-server, but tolerates large prompts. User Ctrl+C still works
 // via the request context for any in-flight call.
+// May 10 2026: ResponseHeaderTimeout removed. V3 pipelines that fire
+// on T2+ edits routinely take 5-15 minutes between when the proxy
+// posts and when llama-server flushes the first response header (it
+// flushes on first decoded token, but prompt eval after a long V3
+// run can take ages on cold KV state). The 10-minute cap fired on
+// turn 5 of a real session and killed an otherwise-working chain.
+// User instruction was to remove the timeout stuff completely.
+// Dial timeout stays — connection refused / DNS failure should still
+// fail fast; that's a different failure mode from "server is working
+// but slow." Request-context cancellation via ctx.Ctx still works,
+// so user-initiated cancels still propagate.
 var llmStreamClient = &http.Client{
 	Transport: &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-		ResponseHeaderTimeout: 10 * time.Minute,
-		IdleConnTimeout:       90 * time.Second,
+		DialContext:     (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		IdleConnTimeout: 90 * time.Second,
 	},
 }
 
@@ -1087,6 +1341,16 @@ var llmStreamClient = &http.Client{
 // that was killing long generations on a single write_file with
 // substantial content (HTML mockups, code with imports, etc.).
 func callLLMOnce(ctx *AgentContext, messages []AgentMessage, temperature float64) (string, int, error) {
+	return callLLMOnceWithGrammar(ctx, messages, temperature, "")
+}
+
+// callLLMOnceWithGrammar is callLLMOnce with an optional GBNF grammar
+// override. When grammar != "", llama-server enforces it at the
+// token-decode level (BiasBusters #2 — banning edit_file/write_file from
+// the tool-name production for a single decision). The json_object
+// response_format is dropped in that case because GBNF is the more
+// specific constraint and supersedes it.
+func callLLMOnceWithGrammar(ctx *AgentContext, messages []AgentMessage, temperature float64, grammar string) (string, int, error) {
 	wireMessages := make([]map[string]string, len(messages))
 	for i, msg := range messages {
 		wireMessages[i] = map[string]string{
@@ -1106,9 +1370,6 @@ func callLLMOnce(ctx *AgentContext, messages []AgentMessage, temperature float64
 		// Without include_usage, the final SSE chunk before [DONE] has no
 		// usage block, so we can't report total_tokens to the TUI.
 		"stream_options": map[string]bool{"include_usage": true},
-		"response_format": map[string]string{
-			"type": "json_object",
-		},
 		// Qwen3.5's chat template defaults enable_thinking=true, but the
 		// agent loop relies on grammar-constrained JSON output — thinking
 		// blocks would just bloat tokens and llama-server rejects the
@@ -1116,6 +1377,14 @@ func callLLMOnce(ctx *AgentContext, messages []AgentMessage, temperature float64
 		// like a "response prefill" (400: "Assistant response prefill is
 		// incompatible with enable_thinking"). Disable explicitly.
 		"enable_thinking": false,
+	}
+	if grammar != "" {
+		// Token-level restriction wins over response_format. llama-server
+		// rejects requests that pass both response_format=json_object and
+		// a non-trivial grammar; pass only the grammar in restricted mode.
+		reqBody["grammar"] = grammar
+	} else {
+		reqBody["response_format"] = map[string]string{"type": "json_object"}
 	}
 	body, _ := json.Marshal(reqBody)
 	endpoint := llamaURL + "/v1/chat/completions"
@@ -1232,11 +1501,20 @@ func callLLMOnce(ctx *AgentContext, messages []AgentMessage, temperature float64
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.ReasoningContent != "" {
-				// Don't stream reasoning tokens to the TUI — they're
-				// not part of the user-visible response and would
-				// double-render if we ever forwarded them. Just
-				// accumulate for the empty-content fallback below.
+				// Accumulate for the empty-content fallback below AND
+				// stream to the TUI as a separate `reasoning_token`
+				// event so users can see the model's thought process.
+				// May 10 2026 reversal of the original "don't stream
+				// reasoning" rule — operator feedback that the TUI
+				// surfacing only tool calls left the model's reasoning
+				// invisible. The TUI subscribes to reasoning_token
+				// distinctly from llm_token so it can render thinking
+				// in a dimmed/italic pane without mixing it into the
+				// content stream destined for parse.
 				reasoningBuf.WriteString(c.Delta.ReasoningContent)
+				ctx.Stream("reasoning_token", map[string]interface{}{
+					"text": c.Delta.ReasoningContent,
+				})
 			}
 			if c.Delta.Content == "" {
 				continue
@@ -1262,23 +1540,60 @@ func callLLMOnce(ctx *AgentContext, messages []AgentMessage, temperature float64
 			fmt.Errorf("read LLM stream: %w", err)
 	}
 
+	// Stash the reasoning content on ctx so the agent loop's per-turn
+	// reasoning-repetition detector can compare it against prior turns.
+	// We capture regardless of whether contentBuf was non-empty — the
+	// model may emit BOTH content (the JSON tool call) AND reasoning
+	// (the prose narration), and we want to detect rehashed reasoning
+	// even when a tool call was successfully emitted.
+	ctx.LastTurnReasoning = reasoningBuf.String()
+
 	if contentBuf.Len() == 0 {
-		// No content deltas — but check reasoning_content first. The
-		// model may have produced its entire response inside a
-		// <think>...</think> block (Qwen3.5's hybrid reasoning mode
-		// firing despite our /nothink directive). The reasoning IS
-		// the response in that case; surface it stripped of the
-		// thinking tags so the JSON inside makes it to the parser.
+		// No content deltas — check reasoning_content. Two distinct cases:
+		//
+		//   (a) Model dumped its actual response into the thinking
+		//       stream (Qwen3.5 hybrid reasoning firing despite the
+		//       /nothink directive). reasoning_content contains a JSON
+		//       tool_call; we recover it and parse normally.
+		//
+		//   (b) Model emitted ONLY thinking ("Now I need to read...")
+		//       and terminated without producing a response. The
+		//       reasoning_content is pure prose narration — there's no
+		//       tool call to recover. Earlier we returned this prose
+		//       as the "response" and it parse-errored every time,
+		//       wasting a turn. Pre-May-8 behavior had the agent
+		//       loop's classifyParseFailure scolding the model with
+		//       "respond in JSON only" — but the corrective is
+		//       useless when the response was truly empty (model
+		//       wasn't disobeying the format, it just stopped mid-flow).
+		//
+		// New behavior: only return recovered reasoning when it
+		// CONTAINS a tool_call envelope. For pure prose, return empty
+		// + log so the caller's retry path can re-prompt with a
+		// "you produced thinking but no response — emit your tool
+		// call now" message instead of treating prose as a failed
+		// response.
 		if reasoningBuf.Len() > 0 {
 			recovered := stripThinkTags(reasoningBuf.String())
-			log.Printf("[agent] PC-043 follow-up: empty content but %d chars of reasoning_content — recovered %d chars after <think> strip",
-				reasoningBuf.Len(), len(recovered))
-			if recovered != "" {
-				return recovered, totalTokens, nil
+			containsToolCall := strings.Contains(recovered, `"type":"tool_call"`) ||
+				strings.Contains(recovered, `"type": "tool_call"`) ||
+				strings.Contains(recovered, `"type":"text"`) ||
+				strings.Contains(recovered, `"type":"done"`)
+			if containsToolCall {
+				log.Printf("[agent] PC-043 follow-up: empty content but %d chars of reasoning_content with embedded tool_call — recovering as response",
+					reasoningBuf.Len())
+				if recovered != "" {
+					return recovered, totalTokens, nil
+				}
 			}
+			// Pure prose narration in reasoning_content with no tool
+			// call. Don't return it — let the caller retry. Logged so
+			// the failure mode stays visible.
+			log.Printf("[agent] PC-043 follow-up: %d chars of reasoning_content was pure narration (no tool_call envelope) — discarding so caller can re-prompt",
+				reasoningBuf.Len())
 		}
-		// Truly nothing. Caller's empty-response retry path
-		// (callLLMConstrained) will handle.
+		// Truly nothing (or only narration). Caller's empty-response
+		// retry path (callLLMConstrained) will handle.
 		return "", totalTokens, nil
 	}
 	return contentBuf.String(), totalTokens, nil
@@ -1634,9 +1949,25 @@ func handleAgent(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
+	// http.ResponseWriter is NOT goroutine-safe. StreamFn fires from at
+	// least two concurrent goroutines during a single agent turn:
+	//   - main agent loop (tool dispatch, LLM SSE forwarding)
+	//   - pollPromptProgress (250ms ticker emitting llm_prompt_progress)
+	// May 10 2026: adding reasoning_token doubled the event rate from
+	// the SSE-decode loop, surfacing a long-latent race where
+	// concurrent Write+Flush calls produced interleaved bytes that
+	// corrupted the chunked-encoding framing — clients then errored
+	// with "chunked line ends with bare LF" and dropped, which the
+	// proxy saw as `context canceled` mid-prompt-eval. Serialize the
+	// writes with a per-handler mutex so chunk framing stays
+	// well-formed regardless of how fast or how concurrently events
+	// fire.
+	var streamMu sync.Mutex
 	ctx.StreamFn = func(eventType string, data interface{}) {
 		event := SSEEvent{Type: eventType, Data: data}
 		eventJSON, _ := json.Marshal(event)
+		streamMu.Lock()
+		defer streamMu.Unlock()
 		fmt.Fprintf(w, "data: %s\n\n", eventJSON)
 		flusher.Flush()
 	}
@@ -1842,9 +2173,14 @@ func categorizeParseFailure(raw string) string {
 func extractModelResponse(raw string) (ModelResponse, error) {
 	raw = strings.TrimSpace(raw)
 
-	// Try direct parse first
+	// Try direct parse first. Capture the error so we can surface it
+	// to the caller's log if every other path fails — without this,
+	// real diagnostics ("invalid character '\\n' in string literal",
+	// "unexpected end of JSON input") were silently swallowed and the
+	// agent loop just got "could not parse JSON" with no clue why.
 	var resp ModelResponse
-	if err := json.Unmarshal([]byte(raw), &resp); err == nil {
+	directErr := json.Unmarshal([]byte(raw), &resp)
+	if directErr == nil {
 		liftMissingArgs(&resp, raw)
 		return resp, nil
 	}
@@ -1888,21 +2224,35 @@ func extractModelResponse(raw string) (ModelResponse, error) {
 		}
 	}
 
+	var balancedErr error
 	if end > start {
 		jsonStr := raw[start:end]
-		if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil {
+		balancedErr = json.Unmarshal([]byte(jsonStr), &resp)
+		if balancedErr == nil {
 			liftMissingArgs(&resp, jsonStr)
 			return resp, nil
 		}
 	}
 
-	// JSON was truncated (max_tokens hit mid-content) — try to recover
-	// If we can see it's a write_file call, extract what we have
-	if strings.Contains(raw, `"write_file"`) && strings.Contains(raw, `"content"`) {
-		return recoverTruncatedWriteFile(raw[start:])
+	// JSON was truncated (max_tokens hit mid-content) or otherwise
+	// malformed — try a generalized tool_call recovery for write_file,
+	// edit_file, and ast_edit. Identical shape (path + payload field),
+	// just different field names. If recovery succeeds, return it; if
+	// not, fall through to the diagnostic error below.
+	if recovered, ok := recoverTruncatedToolCall(raw[start:]); ok {
+		return recovered, nil
 	}
 
-	return resp, fmt.Errorf("could not parse JSON from response")
+	// Surface the most informative error available. directErr fires
+	// when the response had garbage outside the JSON envelope (prose
+	// preamble) — usually less useful. balancedErr fires when the
+	// brace-balanced substring still failed to Unmarshal — that's the
+	// actual JSON-content bug, e.g. literal LF inside a string,
+	// unescaped backslash, malformed escape sequence. Prefer it.
+	if balancedErr != nil {
+		return resp, fmt.Errorf("could not parse JSON from response: %w", balancedErr)
+	}
+	return resp, fmt.Errorf("could not parse JSON from response: %w", directErr)
 }
 
 // liftMissingArgs handles models that emit tool calls in shapes other than
@@ -1970,6 +2320,139 @@ func liftMissingArgs(resp *ModelResponse, raw string) {
 	if buf, err := json.Marshal(lifted); err == nil {
 		resp.Args = buf
 	}
+}
+
+// recoverTruncatedToolCall is the generalized counterpart to
+// recoverTruncatedWriteFile. May 9 2026: under BiasBusters mitigations
+// the model now reaches for ast_edit and edit_file too, and either can
+// land malformed JSON (truncated content, stray escape) the same way
+// write_file used to. Old code only recovered write_file; everything
+// else just died with "could not parse JSON". Now we sniff the tool
+// name from the partial bytes and dispatch to a tool-specific recovery
+// when one exists. Returns (response, true) on successful recovery,
+// (zero, false) when no recovery is available so the caller falls
+// through to the diagnostic error.
+func recoverTruncatedToolCall(partial string) (ModelResponse, bool) {
+	switch {
+	case strings.Contains(partial, `"name":"write_file"`) || strings.Contains(partial, `"name": "write_file"`):
+		if r, err := recoverTruncatedWriteFile(partial); err == nil {
+			return r, true
+		}
+	case strings.Contains(partial, `"name":"ast_edit"`) || strings.Contains(partial, `"name": "ast_edit"`):
+		if r, err := recoverTruncatedAstEdit(partial); err == nil {
+			return r, true
+		}
+	case strings.Contains(partial, `"name":"edit_file"`) || strings.Contains(partial, `"name": "edit_file"`):
+		if r, err := recoverTruncatedEditFile(partial); err == nil {
+			return r, true
+		}
+	}
+	return ModelResponse{}, false
+}
+
+// extractStringField pulls a JSON-string field value out of a partial
+// (possibly truncated) tool-call payload. Returns the unescaped value
+// and true on success. The end is determined by the next unescaped `"`
+// — for the trailing field of a truncated payload, the value runs to
+// end-of-input and is closed by the caller.
+func extractStringField(partial, field string) (string, bool) {
+	for _, marker := range []string{`"` + field + `":"`, `"` + field + `": "`} {
+		idx := strings.Index(partial, marker)
+		if idx < 0 {
+			continue
+		}
+		valueStart := idx + len(marker)
+		// Walk until unescaped closing quote.
+		escaped := false
+		for i := valueStart; i < len(partial); i++ {
+			c := partial[i]
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				raw := partial[valueStart:i]
+				var unescaped string
+				if err := json.Unmarshal([]byte(`"`+raw+`"`), &unescaped); err == nil {
+					return unescaped, true
+				}
+				return raw, true
+			}
+		}
+		// Hit end-of-input without finding closing quote — payload was
+		// truncated mid-string. Return what we have, best-effort
+		// unescaping; trailing backslash is dropped to avoid invalid
+		// escape sequences.
+		raw := strings.TrimRight(partial[valueStart:], "\\")
+		var unescaped string
+		if err := json.Unmarshal([]byte(`"`+raw+`"`), &unescaped); err == nil {
+			return unescaped, true
+		}
+		// Manual fallback for the common escapes when Unmarshal rejected
+		// a partial string (rarely happens but cheap insurance).
+		manual := strings.ReplaceAll(raw, `\n`, "\n")
+		manual = strings.ReplaceAll(manual, `\t`, "\t")
+		manual = strings.ReplaceAll(manual, `\"`, `"`)
+		manual = strings.ReplaceAll(manual, `\\`, `\`)
+		return manual, true
+	}
+	return "", false
+}
+
+// recoverTruncatedAstEdit recovers an ast_edit tool call whose JSON
+// envelope didn't survive the parser. ast_edit's args are
+// {path, selector, content} — same shape as write_file but with an
+// additional selector field that's always short (function:NAME,
+// class:NAME, <tag>) so it lands intact even on truncation. The
+// content is the long field that gets cut.
+func recoverTruncatedAstEdit(partial string) (ModelResponse, error) {
+	path, ok := extractStringField(partial, "path")
+	if !ok || path == "" {
+		return ModelResponse{}, fmt.Errorf("ast_edit recovery: missing path")
+	}
+	selector, ok := extractStringField(partial, "selector")
+	if !ok || selector == "" {
+		return ModelResponse{}, fmt.Errorf("ast_edit recovery: missing selector")
+	}
+	content, ok := extractStringField(partial, "content")
+	if !ok {
+		return ModelResponse{}, fmt.Errorf("ast_edit recovery: missing content")
+	}
+	args, _ := json.Marshal(AstEditInput{Path: path, Selector: selector, Content: content})
+	log.Printf("[agent] recovered truncated ast_edit: path=%s selector=%q content=%d chars",
+		path, selector, len(content))
+	return ModelResponse{Type: "tool_call", Name: "ast_edit", Args: args}, nil
+}
+
+// recoverTruncatedEditFile recovers an edit_file tool call. Args are
+// {path, old_str, new_str, replace_all?}. Either old_str or new_str
+// can be the truncation point; recover whichever one terminated
+// cleanly and warn-log when one didn't, so the agent loop sees the
+// failure category instead of a generic parse error.
+func recoverTruncatedEditFile(partial string) (ModelResponse, error) {
+	path, ok := extractStringField(partial, "path")
+	if !ok || path == "" {
+		return ModelResponse{}, fmt.Errorf("edit_file recovery: missing path")
+	}
+	oldStr, oldOK := extractStringField(partial, "old_str")
+	newStr, newOK := extractStringField(partial, "new_str")
+	if !oldOK && !newOK {
+		return ModelResponse{}, fmt.Errorf("edit_file recovery: missing both old_str and new_str")
+	}
+	replaceAll := strings.Contains(partial, `"replace_all":true`) ||
+		strings.Contains(partial, `"replace_all": true`)
+	args, _ := json.Marshal(EditFileInput{
+		Path:       path,
+		OldStr:     oldStr,
+		NewStr:     newStr,
+		ReplaceAll: replaceAll,
+	})
+	log.Printf("[agent] recovered truncated edit_file: path=%s old_str=%dch new_str=%dch", path, len(oldStr), len(newStr))
+	return ModelResponse{Type: "tool_call", Name: "edit_file", Args: args}, nil
 }
 
 // recoverTruncatedWriteFile attempts to recover a write_file tool call

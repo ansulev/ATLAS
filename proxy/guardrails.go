@@ -194,6 +194,110 @@ func shellRejectionMessage(verb, detail string) string {
 	return "run_command refused: " + detail + ". Modify files with the dedicated tools — `edit_file` (old_str/new_str) for content changes, `write_file` for brand-new files, `delete_file` for removal. Shell `" + verb + "` bypasses the surgical-edit gate, the V3 pipeline, and audit logging, and will be rejected."
 }
 
+// workspaceRefRe matches `/workspace` as a path component (preceded by
+// non-word char or line start, followed by /, whitespace, end, or
+// non-word char). Avoids false matches inside e.g. `/home/foo_workspace`.
+var workspaceRefRe = regexp.MustCompile(`(^|[^a-zA-Z0-9_])/workspace(/|\s|$|[^a-zA-Z0-9_])`)
+
+// validateWorkingDirReference rejects shell commands that reference
+// `/workspace` when /workspace is not the project's working directory.
+//
+// Qwen3.5 has a stubborn training-data prior toward `/workspace` as a
+// generic project sandbox path — coding-assistant fine-tunes use it
+// heavily. The system prompt explicitly warns against absolute paths
+// but the prior leaks through under conversation pressure. May 8 2026
+// flask test: model emitted a correct `cd /home/isaac/snake && python
+// app.py` at turn 7, then drifted at turn 9 to `cd /workspace && python
+// app.py` and burned three turns retrying that wrong path. This guard
+// catches the drift one turn earlier with a rejection that names the
+// actual workingDir, so the model can self-correct in one round-trip.
+//
+// Returns "" if (a) workingDir is empty, (b) cmd doesn't reference
+// /workspace, (c) the actual project IS at /workspace (no false reject),
+// or (d) the /workspace mention is a substring of an unrelated path
+// (`/home/foo_workspace`). Otherwise returns a rejection string.
+func validateWorkingDirReference(cmd, workingDir string) string {
+	if workingDir == "" {
+		return ""
+	}
+	if !strings.Contains(cmd, "/workspace") {
+		return ""
+	}
+	if workingDir == "/workspace" || strings.HasPrefix(workingDir, "/workspace/") {
+		return ""
+	}
+	if !workspaceRefRe.MatchString(cmd) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"command refused: references /workspace, which is not your project root. Working directory is %s — `cd %s && ...` for shell commands, or use relative paths from there. /workspace is a generic training-data prior, not this project's path.",
+		workingDir, workingDir)
+}
+
+// validateRunCommand chains the shell-mutation gate and the workingDir
+// gate. Used by both run_command and run_background paths in the agent
+// loop. Empty return = command is allowed.
+func validateRunCommand(cmd, workingDir string) string {
+	if r := validateShellCommand(cmd); r != "" {
+		return r
+	}
+	if r := validateWorkingDirReference(cmd, workingDir); r != "" {
+		return r
+	}
+	return ""
+}
+
+// validateNotSuspiciouslyShrunk rejects writes that replace a
+// substantial original with a tiny new payload. May 9 2026 ast_edit
+// failure: model emitted only `<!DOCTYPE html>\n` (16B) for an entire
+// <html>-element rewrite of a 120B file; the on-disk result was a
+// destroyed file passed off as a successful "done". The model usually
+// produces this shape when its response stops mid-output (json_object
+// grammar + /nothink + length bias all converging on minimal valid
+// JSON) — the parser sees a syntactically clean tool_call with empty
+// content, no truncation marker fires, the recovery path doesn't
+// engage, and the destructive write lands.
+//
+// Heuristic: skip the check when the original was already small
+// (line-level edits often legitimately shrink), reject when the new
+// payload is clearly a stub. Threshold history:
+//   v1 (May 9 2026): newSize < 32 — model slipped a 32B stub past it
+//   v2 (May 10 morning): bumped to 128 — false-rejected legit
+//     "5KB function refactored to 80B one-liner" case
+//   v3 (current): 64 — catches today's 32B destructive stubs and any
+//     "doctype-only" outputs while leaving room for real one-liner
+//     refactors. Subtler cases (legitimate-shape but bad code) are
+//     V3's job now that ast_edit always routes through it.
+func validateNotSuspiciouslyShrunk(toolName, path string, oldSize, newSize int) string {
+	if oldSize < 100 {
+		return ""
+	}
+	if newSize >= 64 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s refused: replacement is suspiciously small (%dB) for an existing %dB target at %s. The model usually emits this shape when its response was cut off mid-output or stopped after only the doctype/scaffolding. Re-emit %s with the FULL replacement body — don't ship a stub for a real rewrite.",
+		toolName, newSize, oldSize, path, toolName)
+}
+
+// leadingDoctypeRe matches an HTML5 <!DOCTYPE ...> declaration at the
+// very start of a string (allowing whitespace before it). Case-insensitive
+// per spec.
+var leadingDoctypeRe = regexp.MustCompile(`(?i)^\s*<!DOCTYPE[^>]*>\s*\n?`)
+
+// stripLeadingDoctype removes a leading <!DOCTYPE> declaration from
+// content. Returns the stripped content and true if a doctype was
+// present, the original content and false otherwise. Used by ast_edit
+// when the selector is <html> to prevent duplicated doctypes (the
+// element selector replaces only <html>...</html>, not the preceding
+// doctype).
+func stripLeadingDoctype(content string) (string, bool) {
+	if loc := leadingDoctypeRe.FindStringIndex(content); loc != nil {
+		return content[loc[1]:], true
+	}
+	return content, false
+}
+
 // shellHiddenCommandRe catches `bash -c "..."` / `sh -c "..."` /
 // `zsh -c "..."` / `dash -c "..."` / `eval ...`. These wrappers can
 // hide arbitrary destructive commands inside a quoted argument that
@@ -230,6 +334,60 @@ func isFixIntentMessage(msg string) bool {
 		}
 	}
 	return false
+}
+
+// actionIntentWords tracks verbs that signal "the user wants something
+// CREATED, MODIFIED, or REPLACED on disk." Distinct from
+// fixIntentWords (which is about repair/verification) — these match
+// feature-build prompts where the model must emit a write_file /
+// edit_file / ast_edit / delete_file before `done` is honest.
+//
+// May 10 2026 false-success case that motivated this: prompt was
+// "Rewrite templates/dashboard.html to display a clean SaaS-style
+// metrics dashboard..." Model spent 6 turns starting servers and
+// curling the placeholder, never edited anything, declared `done`.
+// The fix-intent gate didn't fire because "rewrite" isn't a
+// fix-intent word — but it IS clearly an action-intent word that
+// should have required a productive write.
+var actionIntentWords = []string{
+	"rewrite", "rewriting", "rewritten",
+	"create", "creates", "creating", "created",
+	"add", "adds", "adding", "added",
+	"implement", "implements", "implementing", "implemented",
+	"build", "builds", "building", "built",
+	"write", "writes", "writing", "wrote",
+	"refactor", "refactors", "refactoring", "refactored",
+	"replace", "replaces", "replacing", "replaced",
+	"update", "updates", "updating", "updated",
+	"modify", "modifies", "modifying", "modified",
+	"change", "changes", "changing", "changed",
+	"make a", "make the", "make it",
+	"convert", "converts", "converting", "converted",
+	"redesign", "redesigning", "redesigned",
+}
+
+// isActionIntentMessage returns true when the prompt clearly asks
+// for a state change on disk (create/rewrite/refactor/etc.). The
+// done-without-action gate uses this to bounce a `done` that wasn't
+// preceded by any productive write — which would otherwise pass
+// through silently because the fix-intent gate ignores feature work.
+func isActionIntentMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, w := range actionIntentWords {
+		if strings.Contains(lower, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// actionWithoutProductiveChangeMessage tells the model to actually do
+// the work the user asked for before declaring done. Concrete and
+// directive — points at the missing tool call, not abstract "you
+// haven't done enough." Mirror of verificationRejectionMessage's
+// shape.
+func actionWithoutProductiveChangeMessage(userMsg string) string {
+	return "Cannot declare `done` yet — the user asked you to make a change on disk (rewrite/create/add/implement/refactor/etc.) and you haven't emitted any successful write_file / edit_file / ast_edit / delete_file in this loop. Verification (running the server, curling the page) is NOT the task — it's how you confirm AFTER the change. Re-read the user's request, identify what file needs to change, and emit the appropriate edit tool. Then verify, then done."
 }
 
 // verificationCommandRe matches the leading token of commands that

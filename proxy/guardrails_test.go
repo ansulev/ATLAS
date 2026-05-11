@@ -214,6 +214,282 @@ func TestValidateShellCommandStillAllowsLegitShellWork(t *testing.T) {
 	}
 }
 
+// May 8 2026 flask test surfaced this: model drifted from the real
+// project root (/home/isaac/snake) to a phantom /workspace cwd in
+// run_background, burning turns 8-11. The guard below catches the
+// drift one turn earlier with a rejection that names the actual
+// workingDir, so the model can self-correct in a single round-trip.
+func TestValidateWorkingDirReferenceRejectsPhantomWorkspace(t *testing.T) {
+	const wd = "/home/isaac/snake"
+	cases := []string{
+		"cd /workspace && python app.py",
+		"cd /workspace && pip install flask",
+		"python /workspace/app.py",
+		"ls /workspace",
+		"pytest /workspace/tests/",
+		// trailing path components — must still flag
+		"cd /workspace/templates && tree",
+	}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			if got := validateWorkingDirReference(cmd, wd); got == "" {
+				t.Errorf("validateWorkingDirReference(%q, %q) = empty, want rejection", cmd, wd)
+			}
+		})
+	}
+}
+
+func TestValidateWorkingDirReferenceAllowsLegitWorkspaceProject(t *testing.T) {
+	// When the project actually IS at /workspace (e.g. the docker-compose
+	// default deployment), the guard must NOT reject — false rejects
+	// would break legit setups.
+	cases := []struct{ wd, cmd string }{
+		{"/workspace", "cd /workspace && python app.py"},
+		{"/workspace/myproject", "cd /workspace/myproject && pytest"},
+		{"/workspace", "ls /workspace/templates"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cmd, func(t *testing.T) {
+			if got := validateWorkingDirReference(tc.cmd, tc.wd); got != "" {
+				t.Errorf("validateWorkingDirReference(%q, wd=%q) rejected: %s", tc.cmd, tc.wd, got)
+			}
+		})
+	}
+}
+
+func TestValidateWorkingDirReferenceIgnoresUnrelatedPaths(t *testing.T) {
+	// The /workspace check must be precise — substring matches inside
+	// other paths (e.g. /home/foo_workspace) and non-/workspace commands
+	// must pass through untouched. Empty workingDir is also a no-op
+	// (during early bootstrap before AgentContext is fully populated).
+	const wd = "/home/isaac/snake"
+	cases := []struct{ name, cmd string }{
+		{"unrelated path with workspace substring", "ls /home/isaac/foo_workspace_dir/"},
+		{"workspace word, no slash", "echo workspace"},
+		{"no workspace at all", "python app.py"},
+		{"build command", "pytest tests/"},
+		{"npm command", "npm run build"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validateWorkingDirReference(tc.cmd, wd); got != "" {
+				t.Errorf("validateWorkingDirReference(%q, wd=%q) rejected: %s", tc.cmd, wd, got)
+			}
+		})
+	}
+	// Empty workingDir = no-op
+	if got := validateWorkingDirReference("cd /workspace && python app.py", ""); got != "" {
+		t.Errorf("validateWorkingDirReference with empty workingDir rejected: %s", got)
+	}
+}
+
+func TestValidateRunCommandChainsBothGates(t *testing.T) {
+	const wd = "/home/isaac/snake"
+	// Shell-mutation gate fires first (more specific message).
+	if got := validateRunCommand("rm -rf /workspace/foo", wd); got == "" || !strings.Contains(got, "rm") {
+		t.Errorf("expected shell-mutation rejection mentioning rm, got %q", got)
+	}
+	// /workspace gate fires when shell-mutation is clean.
+	if got := validateRunCommand("cd /workspace && python app.py", wd); got == "" || !strings.Contains(got, "/workspace") {
+		t.Errorf("expected workspace rejection, got %q", got)
+	}
+	// Both clean → empty.
+	if got := validateRunCommand("python app.py", wd); got != "" {
+		t.Errorf("expected pass-through, got rejection %q", got)
+	}
+}
+
+// May 9 2026 ast_edit destructive-stub case: model emitted only
+// "<!DOCTYPE html>\n" (16B) for an entire <html>-element rewrite of a
+// 120B file, ast_edit "succeeded", file destroyed, model declared
+// "done". Guard catches this exact shape without false-rejecting
+// realistic small replacements.
+func TestValidateNotSuspiciouslyShrunkRejectsDestructiveStub(t *testing.T) {
+	// Today's exact case.
+	if got := validateNotSuspiciouslyShrunk("ast_edit", "templates/index.html", 120, 16); got == "" {
+		t.Error("expected rejection for 120B → 16B replacement")
+	}
+	// Larger original, larger stub — still flagged.
+	if got := validateNotSuspiciouslyShrunk("ast_edit", "app.py", 5000, 20); got == "" {
+		t.Error("expected rejection for 5000B → 20B replacement")
+	}
+	// edit_file path covered by the same guard.
+	if got := validateNotSuspiciouslyShrunk("edit_file", "app.py", 200, 8); got == "" {
+		t.Error("expected rejection for edit_file 200B → 8B")
+	}
+	// May 10 2026: the 32B-just-passes failure that motivated bumping
+	// the floor from 32 to 128. Model emitted exactly 32B for an HTML
+	// body rewrite — clearly a stub but slipped past the v1 guard.
+	if got := validateNotSuspiciouslyShrunk("ast_edit", "templates/dashboard.html", 2199, 32); got == "" {
+		t.Error("expected rejection for 2199B → 32B (the May 10 boundary case)")
+	}
+	// 60B replacement of 2KB original — under the 64B floor.
+	if got := validateNotSuspiciouslyShrunk("ast_edit", "templates/index.html", 2000, 60); got == "" {
+		t.Error("expected rejection for 2000B → 60B (below 64B floor)")
+	}
+}
+
+func TestValidateNotSuspiciouslyShrunkAllowsLegitEdits(t *testing.T) {
+	cases := []struct {
+		name             string
+		old, new         int
+	}{
+		{"original below threshold (line edit)", 50, 5},
+		{"genuine small change", 200, 150},
+		{"replace_all collapsing duplicates", 800, 400},
+		{"new content >= 64B (above threshold)", 1500, 64},
+		{"new content well above threshold", 200, 200},
+		{"refactor to one-liner with reasonable body (5KB → 80B)", 5000, 80},
+		{"both small (below 100B trigger)", 80, 20},
+		{"empty original (new file via ast_edit-ish path)", 0, 16},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validateNotSuspiciouslyShrunk("ast_edit", "x.py", tc.old, tc.new); got != "" {
+				t.Errorf("validateNotSuspiciouslyShrunk(%d, %d) rejected: %s", tc.old, tc.new, got)
+			}
+		})
+	}
+}
+
+func TestValidateNotSuspiciouslyShrunkRejectionMessage(t *testing.T) {
+	// The rejection text must (a) name the tool so the model knows what
+	// to retry, (b) report old/new sizes so the model can see it WAS
+	// truncated, and (c) tell it to re-emit the FULL body.
+	got := validateNotSuspiciouslyShrunk("ast_edit", "templates/index.html", 120, 16)
+	if got == "" {
+		t.Fatal("expected rejection")
+	}
+	for _, s := range []string{"ast_edit refused", "16B", "120B", "FULL", "templates/index.html"} {
+		if !strings.Contains(got, s) {
+			t.Errorf("rejection missing %q: %s", s, got)
+		}
+	}
+}
+
+// May 8 2026 flask test: dashboard.html ended up with two consecutive
+// <!DOCTYPE html> lines after a successful ast_edit. Root cause: model
+// included <!DOCTYPE html> in `content` when selector was <html>, but
+// ast_edit's <html> selector replaces only the html element — the
+// existing doctype declaration above it was untouched, producing a
+// duplicated doctype. This test locks the strip behaviour.
+func TestStripLeadingDoctype(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		stripped bool
+	}{
+		{
+			name: "html5 doctype",
+			in:   "<!DOCTYPE html>\n<html><body></body></html>",
+			want: "<html><body></body></html>",
+			stripped: true,
+		},
+		{
+			name: "html5 doctype lowercase",
+			in:   "<!doctype html>\n<html></html>",
+			want: "<html></html>",
+			stripped: true,
+		},
+		{
+			name: "doctype with leading whitespace",
+			in:   "  \n<!DOCTYPE html>\n<html></html>",
+			want: "<html></html>",
+			stripped: true,
+		},
+		{
+			name: "no doctype",
+			in:   "<html><body></body></html>",
+			want: "<html><body></body></html>",
+			stripped: false,
+		},
+		{
+			name: "doctype not at start (after content)",
+			in:   "<html><!DOCTYPE html><body></body></html>",
+			want: "<html><!DOCTYPE html><body></body></html>",
+			stripped: false,
+		},
+		{
+			name: "verbose html4 doctype",
+			in:   `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">` + "\n<html></html>",
+			want: "<html></html>",
+			stripped: true,
+		},
+		{
+			name: "empty content",
+			in:   "",
+			want: "",
+			stripped: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := stripLeadingDoctype(tc.in)
+			if got != tc.want {
+				t.Errorf("stripLeadingDoctype(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if ok != tc.stripped {
+				t.Errorf("stripLeadingDoctype(%q) stripped=%v, want %v", tc.in, ok, tc.stripped)
+			}
+		})
+	}
+}
+
+// May 10 2026 false-success: action-intent prompts ("rewrite X", "add Y")
+// were slipping past the fix-intent verification gate, letting the model
+// declare done without making any actual edit. Lock the action-intent
+// vocabulary so this gate stays armed across prompt phrasings.
+func TestIsActionIntentMessage(t *testing.T) {
+	actionIntents := []string{
+		"rewrite templates/dashboard.html",
+		"create a new flask blueprint",
+		"add a logout button to the header",
+		"implement a /health endpoint",
+		"build a metrics page",
+		"refactor app.py to use blueprints",
+		"replace the hero section with a new one",
+		"update the dashboard to show three KPI cards",
+		"modify the User model to track login_at",
+		"change the dashboard layout to flex",
+		"convert this to TypeScript",
+		"redesign templates/index.html for SaaS",
+		// May 10 prompt that motivated this gate:
+		"Rewrite templates/dashboard.html to display a clean SaaS-style metrics dashboard",
+	}
+	for _, m := range actionIntents {
+		if !isActionIntentMessage(m) {
+			t.Errorf("isActionIntentMessage(%q) = false, want true", m)
+		}
+	}
+
+	notAction := []string{
+		"hi",
+		"thanks",
+		"what does this code do",
+		"explain the dashboard route",
+		"is the server running",
+		"why isn't this working", // fix-intent, not action-intent
+		"how do I curl the api",
+	}
+	for _, m := range notAction {
+		if isActionIntentMessage(m) {
+			t.Errorf("isActionIntentMessage(%q) = true, want false", m)
+		}
+	}
+}
+
+func TestActionWithoutProductiveChangeMessage(t *testing.T) {
+	// Sanity: rejection text must (a) tell the model NOT to declare done,
+	// (b) name the missing tools, (c) mention verification ≠ task.
+	got := actionWithoutProductiveChangeMessage("rewrite templates/dashboard.html...")
+	for _, s := range []string{"Cannot declare `done`", "write_file", "edit_file", "ast_edit", "Verification", "NOT the task"} {
+		if !strings.Contains(got, s) {
+			t.Errorf("rejection missing %q: %s", s, got)
+		}
+	}
+}
+
 func TestIsFixIntentMessage(t *testing.T) {
 	fixIntents := []string{
 		"fix the bug in app.py",

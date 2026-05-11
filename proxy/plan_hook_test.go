@@ -375,40 +375,58 @@ func TestHasUserPackagesIgnoresPipOnly(t *testing.T) {
 	}
 }
 
-func TestTierMaxTurnsRaisedDefaults(t *testing.T) {
+// May 10 2026: T1/T2/T3 default to uncapped (returns 0); the 8
+// stuck-pattern detectors are the real safety net. T0 keeps a small
+// cap as a SHAPE constraint (conversational input shouldn't loop).
+// The agent loop treats MaxTurns == 0 as "no limit"; cancellation
+// via ctx.Ctx is the upper bound.
+func TestTierMaxTurnsUncappedDefaults(t *testing.T) {
 	t.Setenv("ATLAS_MAX_TURNS", "")
-	if got := TierMaxTurns(Tier2Medium); got != 60 {
-		t.Errorf("T2 = %d, want 60 (PC-200 raised cap)", got)
+	if got := TierMaxTurns(Tier0Conversational); got != 5 {
+		t.Errorf("T0 = %d, want 5 (shape constraint)", got)
 	}
-	if got := TierMaxTurns(Tier3Hard); got != 100 {
-		t.Errorf("T3 = %d, want 100 (PC-200 raised cap)", got)
+	if got := TierMaxTurns(Tier1Simple); got != 0 {
+		t.Errorf("T1 = %d, want 0 (uncapped)", got)
+	}
+	if got := TierMaxTurns(Tier2Medium); got != 0 {
+		t.Errorf("T2 = %d, want 0 (uncapped)", got)
+	}
+	if got := TierMaxTurns(Tier3Hard); got != 0 {
+		t.Errorf("T3 = %d, want 0 (uncapped)", got)
 	}
 }
 
 func TestTierMaxTurnsEnvOverride(t *testing.T) {
 	t.Setenv("ATLAS_MAX_TURNS", "150")
 	if got := TierMaxTurns(Tier2Medium); got != 150 {
-		t.Errorf("env override = %d, want 150", got)
+		t.Errorf("env override = %d, want 150 (operator's call, no upper clamp)", got)
 	}
 }
 
-func TestTierMaxTurnsZeroMeansAbsoluteMax(t *testing.T) {
+func TestTierMaxTurnsEnvOverrideHighIsHonored(t *testing.T) {
+	// May 10 2026: removed the absoluteMaxTurns ceiling. If the
+	// operator says 10000, that's their call.
+	t.Setenv("ATLAS_MAX_TURNS", "10000")
+	if got := TierMaxTurns(Tier2Medium); got != 10000 {
+		t.Errorf("env=10000 = %d, want 10000 (no upper clamp)", got)
+	}
+}
+
+func TestTierMaxTurnsZeroEnvFallsThrough(t *testing.T) {
+	// env=0 means "fall through to tier default" — for T2 that's 0
+	// (uncapped). For T0 that's 5 (shape cap).
 	t.Setenv("ATLAS_MAX_TURNS", "0")
-	if got := TierMaxTurns(Tier2Medium); got != absoluteMaxTurns {
-		t.Errorf("env=0 = %d, want %d (absolute hard wall)", got, absoluteMaxTurns)
+	if got := TierMaxTurns(Tier2Medium); got != 0 {
+		t.Errorf("env=0, T2 = %d, want 0 (uncapped default)", got)
 	}
-}
-
-func TestTierMaxTurnsClampsAboveAbsolute(t *testing.T) {
-	t.Setenv("ATLAS_MAX_TURNS", "999")
-	if got := TierMaxTurns(Tier2Medium); got != absoluteMaxTurns {
-		t.Errorf("env=999 = %d, want clamped to %d", got, absoluteMaxTurns)
+	if got := TierMaxTurns(Tier0Conversational); got != 5 {
+		t.Errorf("env=0, T0 = %d, want 5 (shape cap preserved)", got)
 	}
 }
 
 func TestTierMaxTurnsInvalidEnvFallsThrough(t *testing.T) {
 	t.Setenv("ATLAS_MAX_TURNS", "garbage")
-	if got := TierMaxTurns(Tier2Medium); got != 60 {
-		t.Errorf("invalid env = %d, want 60 (tier default)", got)
+	if got := TierMaxTurns(Tier2Medium); got != 0 {
+		t.Errorf("invalid env, T2 = %d, want 0 (uncapped default)", got)
 	}
 }
