@@ -67,7 +67,9 @@ The Go proxy that runs the agent loop, routes tool calls, and orchestrates the A
 | Exploration budget skip | 5+ consecutive reads | Skips the read, returns warning |
 | Error loop breaker | 3 consecutive failures | Stops agent loop |
 | T2 threshold | 50 lines + 3 logic indicators | Minimum for V3 activation |
-| write_file rejection | Existing files > 100 lines | Forces use of edit_file |
+| write_file rejection | Existing files > 5 lines | Forces `ast_edit` (whole node, .py/.html/.htm) or `edit_file` (surgical) |
+| Per-step grammar gate | Trigger: write_file rejection on existing .py/.html/.htm > 5 lines | Bans `edit_file` and `write_file` from GBNF tool-name production for next decision (BiasBusters #2/#3) |
+| ASA control vector | Auto-loaded from `/models/ast_edit_steering.gguf` if present (always-on by default) | Activates llama-server `--control-vector-scaled` whenever the file exists at the standard path. Override path with `ATLAS_CONTROL_VECTOR`; tune with `ATLAS_CONTROL_VECTOR_SCALE` (default 0.5) and `ATLAS_CONTROL_VECTOR_LAYER_RANGE` (default all). Workflow: `geometric-lens/asa_calibration/README.md` |
 | Conversation trim | 12 messages max | Keeps system + first user + last 8 |
 | Command stdout limit | 8,000 chars | Prevents context flooding |
 | Command stderr limit | 4,000 chars | Prevents context flooding |

@@ -84,36 +84,24 @@ graph LR
 
 ```mermaid
 flowchart LR
-    Start["User msg"] --> PlanGate{"T0 / short ack?"}
-    PlanGate -->|"No"| Plan["/v3/plan\n(3 candidates)"] --> Build["Build prompt\n(plan inlined)"]
-    PlanGate -->|"Yes"| Build
-    Build --> Call["llama-server"] --> Parse["Parse JSON"]
+    Start["User msg"] --> Build["Build prompt"] --> Call["llama-server"] --> Parse["Parse JSON"]
     Parse --> Route{Type?}
 
     Route -->|"tool_call"| Tier{"T2?"}
     Tier -->|"Yes"| V3["V3 Pipeline"] --> Result["Append result"]
     Tier -->|"No"| Exec["Execute tool"] --> Result
-    Result --> Adhere["Plan adherence\n(off-streak counter)"]
-    Adhere --> Revise{"streak ≥ 3?"}
-    Revise -->|"Yes"| RePlan["/v3/plan\n(revised)"] --> Budget
-    Revise -->|"No"| Budget{"Budget?"}
+    Result --> Budget{"Budget?"}
     Budget -->|"< 4"| Call
     Budget -->|"4"| Warn["Nudge: write now"] --> Call
     Budget -->|"5+"| Skip["Skip read"] --> Call
 
     Route -->|"text"| Stream["Stream"] --> Call
-    Route -->|"done"| VerifyGate{"verified?"}
-    VerifyGate -->|"Yes"| Done["End"]
-    VerifyGate -->|"No"| Reject["Reject: run verify_step"] --> Call
+    Route -->|"done"| Done["End"]
 
     style Start fill:#1a3a5c,color:#fff
     style Done fill:#333,color:#fff
     style V3 fill:#2d5016,color:#fff
-    style Plan fill:#2d5016,color:#fff
-    style RePlan fill:#5c3a1a,color:#fff
 ```
-
-**Plan mode** (PC-183 → PC-187) inserts a pre-flight planning step before the first LLM call: see [PLAN_MODE.md](PLAN_MODE.md). The planner samples 3 plan candidates, scores them heuristically, and inlines the winner into the system prompt. An adherence gate counts off-plan tool calls; after 3 in a row the plan auto-revises with whatever context the agent has discovered. Skipped for trivial-chat tier (T0) and short acks.
 
 ### Grammar Enforcement
 
@@ -129,18 +117,54 @@ The JSON schema uses `oneOf` with `additionalProperties: false` and enumerates t
 
 ### Tools
 
-8 tools available to the model:
+9 tools available to the model:
 
 | Tool | Purpose | Read-only |
 |------|---------|-----------|
 | `read_file` | Read file contents (with optional offset/limit) | Yes |
-| `write_file` | Create new file or overwrite (routes to V3 for T2 files) | No |
-| `edit_file` | Replace exact string in file (old_str/new_str) | No |
+| `write_file` | Create a NEW file (rejected for existing files >5 lines — see safety limits) | No |
+| `edit_file` | Surgical inline string replacement (old_str/new_str) for ≤10-line changes | No |
+| `ast_edit` | Whole-function/class/HTML-element rewrite via tree-sitter selector (`function:NAME`, `class:NAME`, `<tag>`); REQUIRED over edit_file for whole-node swaps. GH #39, .py/.html/.htm only in v1 | No |
 | `delete_file` | Delete file or empty directory (forces loop exit after) | No |
 | `run_command` | Execute shell command (5 min timeout cap) | No |
 | `search_files` | Regex search across files (max 200 matches, skips .git/node_modules) | Yes |
 | `list_directory` | List directory contents with type and size | Yes |
 | `plan_tasks` | Decompose work into parallel tasks with dependencies | No |
+
+### Tool-selection bias mitigations (May 2026 BiasBusters synthesis)
+
+Qwen3.5-9B has a documented bias toward `edit_file` over `ast_edit` even
+when ast_edit is correct (BiasBusters arxiv 2510.00307 — embeddings of
+nearby tool names compete; descriptions matter more than names). Four
+defenses compose in the proxy:
+
+1. **Description rewrite** (`proxy/tools.go`). edit_file's description
+   warns against whole-file/whole-function use; ast_edit's description
+   says REQUIRED for >10-line / whole-node swaps; write_file's says
+   NEW files only.
+2. **Conditional GBNF grammar** (`proxy/grammar.go`,
+   `proxy/agent.go:stepExclusions`). When a write_file is rejected on
+   an existing .py/.html/.htm file >5 lines, the next LLM call is
+   constrained by a GBNF grammar that bans edit_file and write_file
+   from the tool-name production. The model physically cannot emit
+   them. Restriction expires after one decision.
+3. **Per-step tool-list filter** (same trigger). An ephemeral
+   `[system note]` user message is injected reminding the model that
+   ast_edit is the only structural-edit tool for this step.
+4. **ASA steering vectors** (`geometric-lens/asa_calibration/`).
+   Activation steering shifts the residual-stream distribution upstream
+   so ast_edit is preferred even on first-attempt decisions before any
+   rejection has fired. Auto-loaded by `inference/entrypoint-v3.1-9b.sh`
+   from `/models/ast_edit_steering.gguf` if the file exists — always-on
+   once the operator has built and dropped the vector via the workflow
+   in `geometric-lens/asa_calibration/README.md`. Override path/scale/
+   layer-range via `ATLAS_CONTROL_VECTOR*` env vars.
+
+All four mitigations compose: ASA biases the proposal distribution
+upstream (item 4), grammar is a hard ban after rejection (item 2),
+the system note keeps the model's working palette focused (item 3),
+and descriptions provide the always-applicable steering signal in the
+prompt itself (item 1).
 
 ### Per-File Tier Classification
 
@@ -168,7 +192,11 @@ Each `write_file`/`edit_file` call is classified independently:
 | Limit | Value | Purpose |
 |-------|-------|---------|
 | Conversation trim | Keep 12 messages max (system + first user + last 8) | Prevent context overflow |
-| write_file for existing files | Reject if file > 100 lines | Forces edit_file for targeted changes |
+| write_file for existing files | Reject if file > 5 lines (PC-159 hardened); on .py/.html/.htm the rejection text + per-step grammar gate steers to `ast_edit` | Forces ast_edit (whole node) or edit_file (surgical) for targeted changes |
+| /workspace phantom-dir gate | run_command + run_background reject commands referencing `/workspace` when that's not the project root | Catches Qwen3.5's training-data prior toward `/workspace` as a generic sandbox path; rejection names the actual workingDir so the model can self-correct in one round-trip |
+| ast_edit `<html>` doctype strip | Detects `<!DOCTYPE>` at start of `content` when selector is `<html>` and strips it before write | Prevents duplicated doctype on disk — `<html>` selector replaces only the `<html>` element, not the preceding doctype |
+| Suspicious-shrinkage guard | ast_edit + edit_file reject when old > 100B and new < 32B | Catches the May 9 2026 destructive-stub bug — model emits only `<!DOCTYPE html>\n` for an entire `<html>` rewrite under json_object grammar pressure, ast_edit "succeeds", file destroyed |
+| ast_edit V3 routing | After AST replacement, run V3 (lens score + sandbox + repair) on the post-edit full file when file is T2+ | Mirrors edit_file's PC-042 path — without it ast_edit shipped whatever the model emitted with no quality gate |
 | Truncation detection | JSON parse check on tool args | Catches truncated model output |
 | Error loop breaker | 3 consecutive failures | Stops runaway failure cycles |
 | Exploration budget warning | 4 consecutive read-only calls | Inject "write your changes now" |
@@ -599,4 +627,4 @@ sequenceDiagram
     A-->>U: File updated
 ```
 
-Existing files over 100 lines are rejected for `write_file` — the model must use `edit_file` with targeted changes.
+Existing files over 5 lines are rejected for `write_file` — the model must use `edit_file` (surgical, ≤10 lines) or `ast_edit` (whole-node rewrite, .py/.html/.htm only). On `.py`/`.html`/`.htm` files, the per-step grammar gate (BiasBusters #2) actively bans `edit_file`/`write_file` from the tool-name production for the next decision so the model can't relapse to the wrong shortcut.
