@@ -5,7 +5,7 @@ import math
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 
 def score_candidate(text: str, rag_api_url: str) -> Tuple[float, float]:

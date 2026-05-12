@@ -10,7 +10,6 @@ Source: https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv
 
 import csv
 import io
-import json
 import re
 import urllib.request
 from pathlib import Path

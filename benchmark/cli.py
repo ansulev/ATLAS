@@ -20,15 +20,12 @@ Usage:
 import argparse
 import json
 import logging
-import os
 import shutil
-import sys
-import tempfile
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set, Dict, Any
+from typing import List, Set, Dict, Any
 
 from .config import config
 from .models import BenchmarkTask, TaskResult, BenchmarkRun
@@ -39,7 +36,6 @@ from .datasets import (
     LiveCodeBenchDataset, SciCodeDataset,
 )
 from .analysis import calculate_pass_at_k, CostAnalyzer, collect_hardware_info
-from .analysis.hardware_info import hardware_info_to_markdown
 from .analysis.pass_at_k import compare_with_baseline
 
 

@@ -1,9 +1,8 @@
 """Hebbian co-retrieval graph — directed weighted edges in Redis sorted sets."""
 
 import logging
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Set
 
-import redis
 
 from cache.pattern_store import get_pattern_store
 

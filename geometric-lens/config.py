@@ -2,7 +2,7 @@ import os
 import yaml
 import json
 from pydantic import BaseModel
-from typing import Dict, Optional
+from typing import Dict
 
 
 class ServerConfig(BaseModel):

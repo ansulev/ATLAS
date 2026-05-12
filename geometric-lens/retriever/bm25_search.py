@@ -1,9 +1,9 @@
 """BM25-based exact identifier search — fast path for specific lookups."""
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
-from indexer.bm25_index import BM25Index, BM25Result
+from indexer.bm25_index import BM25Index
 
 logger = logging.getLogger(__name__)
 

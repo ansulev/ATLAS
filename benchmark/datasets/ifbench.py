@@ -13,7 +13,7 @@ import json
 import re
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from .base import BaseDataset
 from ..models import BenchmarkTask

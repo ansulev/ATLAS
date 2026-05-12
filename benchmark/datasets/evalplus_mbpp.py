@@ -11,7 +11,7 @@ Source: https://huggingface.co/datasets/evalplus/mbppplus
 import json
 import urllib.request
 from pathlib import Path
-from typing import List, Dict
+from typing import List
 
 from .base import BaseDataset
 from ..models import BenchmarkTask

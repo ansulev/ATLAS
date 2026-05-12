@@ -7,8 +7,7 @@ and novel efficiency metrics like Tokens/Watt-Hour.
 
 import statistics
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
-from pathlib import Path
+from typing import Dict, Any, List
 
 from ..models import BenchmarkRun, TaskResult
 from ..config import config

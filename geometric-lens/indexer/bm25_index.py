@@ -1,11 +1,10 @@
 """BM25 inverted index for exact identifier lookup."""
 
-import json
 import math
 import logging
 import re
 from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 
 from models.tree_node import TreeNode, TreeIndex
 

@@ -9,10 +9,9 @@ Provides four selection strategies for choosing among passing candidates:
 Config: ATLAS_V3_SELECTION_STRATEGY in atlas.conf
 """
 
-import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 
 @dataclass

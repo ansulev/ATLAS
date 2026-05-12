@@ -6,7 +6,6 @@ Inspired by OpenCode/Crush terminal UI design.
 
 import sys
 import shutil
-import os
 
 # ANSI escape codes
 RESET = "\033[0m"

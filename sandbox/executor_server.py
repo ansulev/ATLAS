@@ -6,7 +6,6 @@ Provides isolated code execution with resource limits and structured error repor
 """
 
 import os
-import sys
 import shutil
 import signal
 import tempfile

@@ -7,12 +7,10 @@ pass@k = 1 - C(n-c, k) / C(n, k)
 where n = total samples, c = correct samples, k = number of attempts
 """
 
-import json
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from typing import List, Dict, Any
 
 from ..models import TaskResult, BenchmarkRun
 from ..config import config

@@ -473,7 +473,7 @@ def verify_pass_at_k():
 
     except ImportError as e:
         check("Import pass_at_k", False, str(e))
-    except Exception as e:
+    except Exception:
         check("pass@k tests", False, traceback.format_exc())
 
 # ── 6. Runner Isolation ─────────────────────────────────────
@@ -681,7 +681,7 @@ def verify_config():
 
     except ImportError as e:
         check("Import BenchmarkConfig", False, str(e))
-    except Exception as e:
+    except Exception:
         check("Config integration", False, traceback.format_exc())
 
 # ── 8. Hardware Info ────────────────────────────────────────

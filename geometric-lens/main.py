@@ -1,22 +1,20 @@
-import hashlib
 import logging
 import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, asdict
 from enum import Enum
 
 import redis
 import httpx
 from config import config, api_keys
-from storage import project_store, ProjectMetadata
+from storage import project_store
 from pipeline import (
     rag_enhanced_completion, simple_completion, forward_to_llama_stream,
     invalidate_cache,

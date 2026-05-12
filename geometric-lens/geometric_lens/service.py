@@ -10,7 +10,7 @@ Provides:
 import logging
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

@@ -43,7 +43,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Force line-buffered stdout
 sys.stdout.reconfigure(line_buffering=True)
@@ -52,14 +52,14 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmark.config import config
-from benchmark.models import BenchmarkTask, AttemptResult, TaskResult
+from benchmark.models import BenchmarkTask
 from benchmark.runner import BenchmarkRunner, LLMConnectionError, extract_code
 from benchmark.runner import execute_code, execute_code_stdio
 from benchmark.geo_learning import extract_embedding_urllib
 from benchmark.best_of_k import score_candidate
 
 # V3 components
-from benchmark.v3.budget_forcing import BudgetForcing, BudgetForcingConfig, extract_thinking
+from benchmark.v3.budget_forcing import BudgetForcing, BudgetForcingConfig
 from benchmark.v3.plan_search import PlanSearch, PlanSearchConfig
 from benchmark.v3.div_sampling import DivSampling, DivSamplingConfig
 from benchmark.v3.blend_asc import BlendASC, BlendASCConfig
@@ -85,7 +85,7 @@ from benchmark.v3.ace_pipeline import ACEPipeline, ACEConfig
 from benchmark.v3.self_test_gen import SelfTestGen, SelfTestGenConfig
 from benchmark.v3.lens_feedback import LensFeedbackCollector, LensFeedbackConfig
 from benchmark.v3.candidate_selection import (
-    CandidateInfo, select_candidate, STRATEGIES,
+    CandidateInfo, select_candidate,
 )
 from benchmark.v3.embedding_store import EmbeddingWriter
 

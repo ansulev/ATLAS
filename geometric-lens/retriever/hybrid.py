@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from models.tree_node import TreeIndex
 from indexer.bm25_index import BM25Index
@@ -29,7 +29,7 @@ class HybridRetriever:
         self,
         tree_index: TreeIndex,
         bm25_index: BM25Index,
-        llama_url: str = "http://llama-service:8000",
+        llama_url: str = "http://llama-server:8080",
     ):
         self.tree_index = tree_index
         self.bm25_index = bm25_index

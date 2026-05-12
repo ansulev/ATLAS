@@ -1,7 +1,6 @@
 """Record task outcomes to update Thompson Sampling state in Redis."""
 
 import logging
-from typing import Optional
 
 import redis as redis_lib
 

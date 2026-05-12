@@ -17,7 +17,7 @@ No external dependencies (stdlib only).
 import struct
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List
 
 LABEL_FAIL = 0
 LABEL_PASS = 1

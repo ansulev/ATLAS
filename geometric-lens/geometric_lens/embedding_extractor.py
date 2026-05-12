@@ -18,7 +18,7 @@ def _get_embed_url() -> str:
     """
     return os.environ.get(
         "LLAMA_EMBED_URL",
-        os.environ.get("LLAMA_URL", "http://llama-service:8000"),
+        os.environ.get("LLAMA_URL", "http://llama-server:8080"),
     )
 
 

@@ -3,7 +3,7 @@
 import math
 import logging
 
-from models.pattern import Pattern, PatternScore, HALF_LIVES
+from models.pattern import Pattern, PatternScore
 
 logger = logging.getLogger(__name__)
 

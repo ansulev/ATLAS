@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .budget_forcing import BudgetForcing, BudgetForcingConfig, get_system_prompt
+from .budget_forcing import BudgetForcing, get_system_prompt
 
 
 # ---------------------------------------------------------------------------

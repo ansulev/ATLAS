@@ -26,11 +26,10 @@ If no energy available (first generation, no Lens score), uses default_tier.
 import json
 import math
 import re
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------

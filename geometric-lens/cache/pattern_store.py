@@ -1,10 +1,8 @@
 """Redis-backed pattern storage with STM/LTM sorted sets."""
 
-import json
 import logging
 import os
 from typing import List, Optional, Dict
-from datetime import datetime, timezone
 
 import redis
 

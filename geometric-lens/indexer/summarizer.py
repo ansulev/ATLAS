@@ -12,7 +12,7 @@ from models.tree_node import TreeNode, NodeType
 logger = logging.getLogger(__name__)
 
 # Default llama-server URL (overridable)
-LLAMA_URL = "http://llama-service:8000"
+LLAMA_URL = "http://llama-server:8080"
 
 
 async def summarize_tree(

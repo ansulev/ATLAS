@@ -13,7 +13,6 @@ Streams progress events back as SSE for real-time CLI feedback.
 """
 
 import json
-import math
 import os
 import re
 import sys
@@ -22,12 +21,9 @@ import time
 import urllib.request
 import uuid
 import urllib.error
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import io
 
 # Force line-buffered stdout
 sys.stdout.reconfigure(line_buffering=True)

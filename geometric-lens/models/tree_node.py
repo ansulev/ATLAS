@@ -1,7 +1,7 @@
 """Data models for the PageIndex tree index."""
 
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 
 

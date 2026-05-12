@@ -230,7 +230,6 @@ def _launch_local_proxy(proxy_bin: str) -> bool:
     env["ATLAS_LENS_URL"] = LENS_URL
     env["ATLAS_SANDBOX_URL"] = SANDBOX_URL
     env["ATLAS_V3_URL"] = V3_URL
-    env["ATLAS_AGENT_LOOP"] = "1"
     env["ATLAS_MODEL_NAME"] = MODEL_NAME
     # Pin the proxy's "where to write files" target to the directory the user
     # invoked `atlas` from, overriding the proxy's stale-history heuristics.
@@ -510,19 +509,25 @@ def run():
 
     Launch strategy:
     1. `atlas doctor [...]` → run install diagnostic and exit (PC-053)
-    2. `atlas tier`/`atlas tui` → subcommand dispatch
+    2. `atlas init`/`atlas tier`/`atlas tui`/`atlas model` → subcommand dispatch
     3. Default (interactive tty) → launch the Bubbletea TUI
     4. Pipe mode (no tty) → built-in REPL with /solve, /bench
     """
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         from atlas.cli.commands import doctor
         sys.exit(doctor.main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "init":
+        from atlas.cli.commands import init
+        sys.exit(init.main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "tier":
         from atlas.cli.commands import tier
         sys.exit(tier.main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "tui":
         from atlas.cli.commands import tui
         sys.exit(tui.main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "model":
+        from atlas.cli.commands import model
+        sys.exit(model.main(sys.argv[2:]))
 
     # Interactive default → TUI. Pipe mode (e.g. `echo "..." | atlas`) skips
     # the TUI and runs the built-in /solve flow so scripts and CI usage

@@ -13,7 +13,7 @@ each domain contributes proportionally during replay.
 import json
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

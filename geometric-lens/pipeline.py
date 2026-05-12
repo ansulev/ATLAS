@@ -5,7 +5,7 @@ import os
 import httpx
 import logging
 import json
-from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
+from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime, timezone
 
 from config import config
@@ -168,7 +168,6 @@ async def retrieve_chunks_pageindex(
 ) -> List[Dict[str, Any]]:
     """Retrieve chunks using PageIndex (tree search + BM25)."""
     from indexer.persistence import load_index
-    from indexer.bm25_index import BM25Index
     from retriever.hybrid import HybridRetriever
 
     # Check in-memory cache
@@ -482,7 +481,6 @@ async def rag_enhanced_completion(
             from router.signal_collector import collect_signals
             from router.difficulty_estimator import estimate_difficulty
             from router.route_selector import select_route as thompson_select
-            from models.route import Route
 
             # Collect signals
             signals = collect_signals(

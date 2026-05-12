@@ -23,7 +23,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .failure_analysis import (
     FailingCandidate,
-    FailureAnalysis,
     FailureAnalyzer,
     FailureAnalysisConfig,
 )

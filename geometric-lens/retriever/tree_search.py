@@ -3,11 +3,11 @@
 import logging
 import json
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import httpx
 
-from models.tree_node import TreeNode, NodeType
+from models.tree_node import TreeNode
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ MAX_REASONING_CALLS = 40
 class TreeSearcher:
     """LLM-guided tree traversal retriever."""
 
-    def __init__(self, root: TreeNode, llama_url: str = "http://llama-service:8000"):
+    def __init__(self, root: TreeNode, llama_url: str = "http://llama-server:8080"):
         self.root = root
         self.llama_url = llama_url
         self._call_count = 0

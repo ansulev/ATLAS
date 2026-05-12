@@ -8,7 +8,7 @@ a comprehensive markdown report.
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 
 def _load_phase_results(run_dir: Path, phase_name: str) -> Optional[dict]:

@@ -1,9 +1,14 @@
 """atlas doctor — comprehensive install diagnostic (PC-053).
 
-Verifies an ATLAS install is healthy end-to-end. Runs 11 checks across
+Verifies an ATLAS install is healthy end-to-end. Runs ~22 checks across
 the host environment, the docker stack, and a live request through the
-proxy. Designed to be the answer to "is it really working?" — both for
-humans (pretty terminal output) and for scripts (--json).
+proxy: 11 individual checks (docker, compose, nvidia, model_file,
+lens_weights, overcommit, image_skew, tier_match (PC-055),
+tier_constraints (PC-055.1), asa_steering (BiasBusters #4),
+e2e_smoke), six per-container state checks (one per service in
+`EXPECTED_SERVICES`), and five per-endpoint health checks. Designed to
+be the answer to "is it really working?" — both for humans (pretty
+terminal output) and for scripts (--json).
 
 Invoke:
     atlas doctor                 # full check
@@ -274,6 +279,42 @@ def check_lens_weights(atlas_root: str) -> CheckResult:
         f"cost_field.pt + metric_tensor.pt in {weights_dir}")
 
 
+def check_asa_steering(atlas_root: str) -> CheckResult:
+    """ASA steering vector (BiasBusters #4) presence.
+
+    Warn-not-fail: ATLAS works without it. When present, llama-server
+    auto-applies it on startup via `--control-vector-scaled` (see
+    `inference/entrypoint-v3.1-9b.sh`). When absent, the
+    `ast_edit`-vs-`edit_file` proposal bias is unsteered and we lean
+    entirely on the grammar gate downstream.
+
+    Recovery is documented in `geometric-lens/asa_calibration/README.md`
+    — or just re-run `./scripts/atlas-bootstrap.sh` which builds it as
+    part of install (with HuggingFace prebuilt fallback).
+    """
+    # Match the entrypoint's default path so doctor and the inference
+    # entrypoint check the same location.
+    base = MODEL_DIR if os.path.isabs(MODEL_DIR) else os.path.join(atlas_root, MODEL_DIR)
+    path = os.path.normpath(os.path.join(base, "ast_edit_steering.gguf"))
+    override = os.environ.get("ATLAS_CONTROL_VECTOR", "")
+    if override:
+        path = override
+    if not os.path.exists(path):
+        return CheckResult("asa_steering", "warn",
+            "ast_edit_steering.gguf not present",
+            f"expected at {path} — build it via "
+            f"`./scripts/atlas-bootstrap.sh` (auto, ~5 min) or "
+            f"`geometric-lens/asa_calibration/README.md` (manual). "
+            f"ATLAS continues to work without it; the ast_edit-vs-edit_file "
+            f"proposal bias is just unsteered.")
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
+    return CheckResult("asa_steering", "pass",
+        f"ast_edit_steering.gguf ({size_mb:.1f} MB) at {path}")
+
+
 def check_overcommit() -> CheckResult:
     """PC-011: Redis warns and AOF rewrite can fail without overcommit_memory=1."""
     try:
@@ -485,14 +526,15 @@ def check_image_skew(services: List[Dict]) -> CheckResult:
 def check_e2e_smoke() -> CheckResult:
     """End-to-end POST to llama-server — verifies the model loads and generates.
 
-    Targets llama-server directly (not the proxy) because the proxy's
-    agent loop with ATLAS_AGENT_LOOP=1 intercepts /v1/chat/completions and
-    runs the tier classifier + V3 pipeline. For a one-word smoke test the
-    agent loop adds ~30s and frequently consumes all max_tokens in
-    /nothink routing/planning before producing visible content. Hitting
-    llama directly answers the question we care about: "is the GGUF
-    actually loaded and inferring?" The proxy's reachability is already
-    covered by `health/proxy`.
+    Targets llama-server directly (not the proxy). The proxy's `/v1/agent`
+    endpoint runs the full agent loop (tier classifier + V3 pipeline),
+    which would add ~30s and frequently consume all `max_tokens` in
+    routing/planning before producing visible content. Hitting llama
+    directly answers the question we care about: "is the GGUF actually
+    loaded and inferring?" The proxy's reachability is already covered
+    by `health/proxy`. (`/v1/chat/completions` on the proxy itself is a
+    raw passthrough to llama-server — no agent loop — but the smoke test
+    skips the extra hop anyway.)
     """
     body = {
         "messages": [{"role": "user", "content": "Reply with the single word: ATLAS"}],
@@ -692,6 +734,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 8. Lens weights (host-side)
     results.append(check_lens_weights(atlas_root))
+
+    # 8.5. ASA steering vector (BiasBusters #4 — warn-not-fail). Optional
+    # but on by default when present; sits next to lens_weights since both
+    # are host-side artifact checks.
+    results.append(check_asa_steering(atlas_root))
 
     # 9. vm.overcommit_memory (PC-011)
     results.append(check_overcommit())

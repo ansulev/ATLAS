@@ -18,7 +18,7 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .base import BaseDataset
 from ..models import BenchmarkTask
@@ -43,7 +43,6 @@ def _load_h5_targets(h5_path: Path) -> Dict[str, List[Any]]:
     one per test case.
     """
     import h5py
-    import numpy as np
 
     targets = {}
     with h5py.File(h5_path, 'r') as f:

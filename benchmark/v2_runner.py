@@ -24,7 +24,6 @@ import urllib.error
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
 
 # Force line-buffered stdout for real-time progress visibility
 sys.stdout.reconfigure(line_buffering=True)

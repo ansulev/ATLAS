@@ -8,14 +8,12 @@ and executing code in isolated sandboxes with resource limits.
 import json
 import os
 import re
-import signal
 import subprocess
 import tempfile
 import time
 import urllib.request
 import urllib.error
-from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Tuple, List
 
 # Try httpx first, fall back to urllib
 try:

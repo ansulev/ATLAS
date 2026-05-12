@@ -9,7 +9,7 @@ import os
 import platform
 import subprocess
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from ..models import HardwareInfo
 from ..config import config

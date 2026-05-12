@@ -5,9 +5,7 @@ Reads settings from atlas.conf and provides defaults for benchmark operations.
 """
 
 import os
-import re
 from pathlib import Path
-from typing import Optional
 
 
 def get_project_root() -> Path:
