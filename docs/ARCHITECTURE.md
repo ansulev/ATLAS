@@ -51,6 +51,8 @@ llama-server is the only GPU-using service; every other ATLAS service runs on CP
 
 **Backend selection happens at install time, not runtime.** `atlas init` runs `tier.detect_gpu()` (see `atlas/cli/commands/tier.py`), picks the largest-VRAM GPU across all detected vendors (override with `ATLAS_GPU_VENDOR` / `ATLAS_GPU_INDEX`), and writes `ATLAS_BACKEND={cuda|rocm|metal|sycl}` into `.env`. Each backend has its own pre-built image; users don't run a fat image that ships every backend's libraries. The wizard refuses on unsupported-backend hosts rather than writing a `.env` that won't boot.
 
+**Bring-your-own-model surface (V3.1.1).** `atlas lens check` is a cheap pre-flight against a running llama-server that reports whether the loaded model is Lens-compatible (PC-057). `atlas lens build --samples <path>` wraps `geometric-lens/geometric_lens/training.py` to train fresh `cost_field.pt` artifacts at the model's native embedding dim (PC-058). Together they let users swap in non-default GGUFs without forking the lens code — the C(x) constructor accepts arbitrary `input_dim`, so the only thing that changes per-model is the trained weights. See [CLI.md § atlas lens](CLI.md#atlas-lens-pc-057--pc-058) for the user-facing flow; PC-059 (registry write-back) and PC-060 (HF middleman distribution) are the V3.1.2+ follow-ons that close the loop.
+
 **What's vendor-agnostic** (works on every backend): grammar-constrained JSON, self-embeddings (`/embedding`), per-layer hidden states (PC-202 patch), ASA control vectors (loaded by llama.cpp's `control_vector_load` regardless of backend), KV cache quantization, the entire outer agent loop, V3 pipeline, Geometric Lens, and sandbox.
 
 **What differs per backend:**

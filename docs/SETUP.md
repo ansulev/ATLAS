@@ -664,6 +664,28 @@ Training scripts are provided in `scripts/` if you want to train on your own ben
 - `scripts/collect_lens_training_data.py` — Collect pass/fail embeddings from benchmark runs
 - `scripts/prepare_lens_training.py` — Prepare and validate training data format
 
+### Bringing your own model (V3.1.1)
+
+If you want to swap in a non-default GGUF, the `atlas lens` subcommand wraps the probe + train pipeline so you don't have to learn the underlying scripts:
+
+```bash
+# 1. Drop your GGUF in models/ and update .env to point at it, restart llama-server.
+
+# 2. Probe whether the existing artifacts can score it (cheap, no training):
+atlas lens check
+# Reports: compat (artifacts work) | needs-build (different dim) | incompatible
+
+# 3. If 'needs-build', train fresh artifacts at the model's native embedding dim:
+atlas lens build --samples path/to/labeled.json
+# samples format: [{"text": str, "label": 0|1}, ...] where 1 = passing code
+# Canonical training set: huggingface.co/datasets/itigges22/ATLAS
+
+# 4. Re-run check — should now report compat:
+atlas lens check
+```
+
+Full reference: [CLI.md § atlas lens](CLI.md#atlas-lens-pc-057--pc-058).
+
 ---
 
 ## ASA Steering Vector (Auto-Built)

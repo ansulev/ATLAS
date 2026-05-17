@@ -528,6 +528,9 @@ def run():
     if len(sys.argv) > 1 and sys.argv[1] == "model":
         from atlas.cli.commands import model
         sys.exit(model.main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "lens":
+        from atlas.cli.commands import lens
+        sys.exit(lens.main(sys.argv[2:]))
 
     # Interactive default → TUI. Pipe mode (e.g. `echo "..." | atlas`) skips
     # the TUI and runs the built-in /solve flow so scripts and CI usage
