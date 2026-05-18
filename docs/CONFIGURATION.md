@@ -367,6 +367,7 @@ The standalone Python REPL (`pip install -e . && atlas`) reads these variables:
 | `ATLAS_MODEL_FILE` | `Qwen3.5-9B-Q6_K.gguf` | Expected model filename inside `ATLAS_MODELS_DIR`. |
 | `ATLAS_LENS_MODELS` | `./geometric-lens/geometric_lens/models` | Host path that maps to the lens's weight directory. Used by `atlas doctor` so it checks the same directory Docker bind-mounts into the lens container. |
 | `ATLAS_MODEL_NAME` | `Qwen3.5-9B-Q6_K` | Model name for API calls |
+| `HF_TOKEN` | (unset) | HuggingFace write token used by `atlas lens publish` / `atlas asa publish` for artifact upload. Get one at https://huggingface.co/settings/tokens (scope: write). `HUGGINGFACE_HUB_TOKEN` and `HUGGING_FACE_HUB_TOKEN` are also honored. Full walkthrough: [PUBLISHING.md](PUBLISHING.md). |
 
 ### Generation Parameters
 

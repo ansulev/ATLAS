@@ -334,16 +334,19 @@ def test_publish_dry_run_works_without_torch(monkeypatch, tmp_path, capsys):
 
 
 def test_publish_requires_repo_unless_dry_run(monkeypatch, tmp_path, capsys):
-    """No --repo + no --dry-run -> usage error explaining the requirement."""
+    """No --repo + no --dry-run -> usage error explaining the requirement.
+
+    We set HF_TOKEN here so the publish_preflight passes — we want to
+    isolate the test to the --repo check, not the auth gate (covered by
+    test_preflight_blocks_non_dryrun_when_token_missing)."""
+    if not lens._huggingface_hub_available():
+        pytest.skip("huggingface_hub not installed on this host")
     (tmp_path / "cost_field.pt").write_bytes(b"fake")
     monkeypatch.setenv("ATLAS_LENS_MODELS", str(tmp_path))
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy_for_test")
     monkeypatch.setattr(
         lens, "_inspect_cost_field",
         lambda d: lens.ArtifactInspection(present=True, dim=4096))
-    # Make sure HF_TOKEN is unset so we don't even reach the upload path
-    monkeypatch.delenv("HF_TOKEN", raising=False)
-    monkeypatch.delenv("HUGGINGFACE_HUB_TOKEN", raising=False)
-    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
     rc = lens.main(["publish", "Qwen3.5-9B-Q6_K", "--no-color"])
     out = capsys.readouterr().out
     assert rc == 1
@@ -409,3 +412,69 @@ def test_sha256_file_is_deterministic_and_correct(tmp_path):
     (tmp_path / "f.bin").write_bytes(content)
     expected = hashlib.sha256(content).hexdigest()
     assert lens._sha256_file(str(tmp_path / "f.bin")) == expected
+
+
+# ---------------------------------------------------------------------------
+# publish pre-flight panel (PC-059.1 / publishing UX polish)
+# ---------------------------------------------------------------------------
+
+def test_preflight_dry_run_skips_auth_gates(monkeypatch, capsys):
+    """--dry-run should always return True regardless of missing creds —
+    the whole point is letting users preview without setting anything up."""
+    for k in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    ok = lens.publish_preflight("lens", dry_run=True, color=False)
+    out = capsys.readouterr().out
+    assert ok is True, "dry-run preflight should always pass"
+    assert "submission pre-flight" in out
+    assert "PUBLISHING.md" in out, "should reference the docs walkthrough"
+    assert "--dry-run" in out, "should call out that auth gates are skipped"
+
+
+def test_preflight_blocks_non_dryrun_when_token_missing(monkeypatch, capsys):
+    for k in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    ok = lens.publish_preflight("lens", dry_run=False, color=False)
+    out = capsys.readouterr().out
+    assert ok is False, "missing HF_TOKEN in real run should block"
+    assert "HF_TOKEN" in out
+    assert "huggingface.co/settings/tokens" in out
+
+
+def test_preflight_passes_when_token_and_pkg_present(monkeypatch, capsys):
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy_for_test")
+    # huggingface_hub may or may not be installed in CI; only assert pass
+    # when the pkg is genuinely available (otherwise the test would be
+    # flaky depending on host env).
+    if not lens._huggingface_hub_available():
+        pytest.skip("huggingface_hub not installed on this host")
+    ok = lens.publish_preflight("lens", dry_run=False, color=False)
+    out = capsys.readouterr().out
+    assert ok is True
+    assert "HF_TOKEN env var" in out
+
+
+def test_preflight_mentions_both_lens_and_asa_kinds(monkeypatch, capsys):
+    """The panel header should reflect whichever publish flow invoked it
+    so the user isn't confused about what they're shipping."""
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy")
+    lens.publish_preflight("asa", dry_run=True, color=False)
+    out = capsys.readouterr().out
+    assert "atlas asa publish" in out
+    lens.publish_preflight("lens", dry_run=True, color=False)
+    out = capsys.readouterr().out
+    assert "atlas lens publish" in out
+
+
+def test_preflight_gh_missing_is_optional_warning(monkeypatch, capsys):
+    """Without gh installed the preflight should still pass — it just
+    notes the user will paste the PR body manually."""
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy")
+    monkeypatch.setattr(lens, "_gh_available", lambda: False)
+    if not lens._huggingface_hub_available():
+        pytest.skip("huggingface_hub not installed on this host")
+    ok = lens.publish_preflight("lens", dry_run=False, color=False)
+    out = capsys.readouterr().out
+    assert ok is True, "missing gh should not block — paste fallback is valid"
+    assert "gh CLI" in out
+    assert "paste" in out.lower() or "compare" in out.lower()

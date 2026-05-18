@@ -96,19 +96,28 @@ var (
 // renderCalibrationBadge produces the compact badge text that gets
 // appended to the Pipeline pane title.
 //
-//	"  Lens ✓  ASA ✓"   — both supported
-//	"  Lens ⚠  ASA ⚠"   — at least one needs attention
-//	"  cal …"            — fetch still in flight or failed
+//	"  Lens ✓  ASA ✓"                                      — both supported
+//	"  Lens ⚠  ASA ⚠  → atlas lens build · PUBLISHING.md"   — needs attention
+//	"  cal …"                                              — fetch in flight / failed
 //
-// Returns empty string when the badge should not be shown (e.g. the
-// status fetch errored — better to omit than to render a confusing
-// placeholder).
+// When either verdict is non-supported, an inline actionable hint is
+// appended pointing the user at the relevant build command + the docs
+// section that walks through the full contribution flow. The hint lives
+// on the same line as the badge so we don't have to bump the pipeline
+// pane height when calibration is in a warn/fail state.
+//
+// Returns empty string only when the proxy is reachable but returned
+// nothing meaningful — better to omit than render a confusing placeholder.
 func renderCalibrationBadge(s *calibrationStatus) string {
 	if s == nil {
 		return badgeDim.Render("  cal …")
 	}
-	return "  " + renderOneBadge("Lens", s.Lens.Verdict) +
+	badge := "  " + renderOneBadge("Lens", s.Lens.Verdict) +
 		"  " + renderOneBadge("ASA", s.ASA.Verdict)
+	if hint := badgeActionHint(s); hint != "" {
+		badge += "  " + badgeDim.Render(hint)
+	}
+	return badge
 }
 
 func renderOneBadge(name, verdict string) string {
@@ -122,6 +131,27 @@ func renderOneBadge(name, verdict string) string {
 	default:
 		return badgeDim.Render(name + " ?")
 	}
+}
+
+// badgeActionHint returns the one-line "what should I do about this"
+// pointer that gets rendered right next to the badge when either
+// subsystem is in a non-supported state. Empty when both are happy.
+//
+// Suppresses on "unreachable" / "incompatible" because those mean
+// services are down, not that the artifact is wrong — a "build" hint
+// would be misleading there.
+func badgeActionHint(s *calibrationStatus) string {
+	lensWarn := s.Lens.Verdict == "no-artifacts" || s.Lens.Verdict == "dim-mismatch"
+	asaWarn := s.ASA.Verdict == "missing"
+	switch {
+	case lensWarn && asaWarn:
+		return "→ atlas lens build / atlas asa build · docs/PUBLISHING.md"
+	case lensWarn:
+		return "→ atlas lens build · docs/PUBLISHING.md"
+	case asaWarn:
+		return "→ atlas asa build · docs/PUBLISHING.md"
+	}
+	return ""
 }
 
 // calibrationTooltip renders the verbose hint text that the Stats pane

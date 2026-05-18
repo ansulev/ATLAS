@@ -144,3 +144,75 @@ func TestCalibrationTooltip_NilStatus_Empty(t *testing.T) {
 		t.Errorf("expected empty tooltip for nil status, got %q", got)
 	}
 }
+
+func TestBadgeActionHint_BothSupported_Empty(t *testing.T) {
+	s := &calibrationStatus{}
+	s.Lens.Verdict = "supported"
+	s.ASA.Verdict = "supported"
+	if got := badgeActionHint(s); got != "" {
+		t.Errorf("expected no hint when both supported, got %q", got)
+	}
+}
+
+func TestBadgeActionHint_LensWarn_PointsAtBuildAndDocs(t *testing.T) {
+	s := &calibrationStatus{}
+	s.Lens.Verdict = "no-artifacts"
+	s.ASA.Verdict = "supported"
+	got := badgeActionHint(s)
+	if !strings.Contains(got, "atlas lens build") {
+		t.Errorf("lens-warn hint should suggest `atlas lens build`, got %q", got)
+	}
+	if !strings.Contains(got, "PUBLISHING.md") {
+		t.Errorf("hint should reference docs/PUBLISHING.md, got %q", got)
+	}
+	if strings.Contains(got, "atlas asa build") {
+		t.Errorf("ASA was supported, asa-build should NOT appear: %q", got)
+	}
+}
+
+func TestBadgeActionHint_ASAWarn_PointsAtASABuild(t *testing.T) {
+	s := &calibrationStatus{}
+	s.Lens.Verdict = "supported"
+	s.ASA.Verdict = "missing"
+	got := badgeActionHint(s)
+	if !strings.Contains(got, "atlas asa build") {
+		t.Errorf("asa-warn hint should suggest `atlas asa build`, got %q", got)
+	}
+	if strings.Contains(got, "atlas lens build") {
+		t.Errorf("Lens was supported, lens-build should NOT appear: %q", got)
+	}
+}
+
+func TestBadgeActionHint_BothWarn_SuggestsBoth(t *testing.T) {
+	s := &calibrationStatus{}
+	s.Lens.Verdict = "dim-mismatch"
+	s.ASA.Verdict = "missing"
+	got := badgeActionHint(s)
+	if !strings.Contains(got, "atlas lens build") || !strings.Contains(got, "atlas asa build") {
+		t.Errorf("both-warn hint should mention both commands, got %q", got)
+	}
+}
+
+func TestBadgeActionHint_Unreachable_NoBuildSuggestion(t *testing.T) {
+	// When lens/asa are unreachable the artifact is fine — the service is
+	// down. Telling the user to "build" would be misleading.
+	s := &calibrationStatus{}
+	s.Lens.Verdict = "unreachable"
+	s.ASA.Verdict = "incompatible"
+	if got := badgeActionHint(s); got != "" {
+		t.Errorf("expected no build-hint for service-down verdicts, got %q", got)
+	}
+}
+
+func TestRenderCalibrationBadge_WarnIncludesHint(t *testing.T) {
+	s := &calibrationStatus{}
+	s.Lens.Verdict = "no-artifacts"
+	s.ASA.Verdict = "supported"
+	got := renderCalibrationBadge(s)
+	if !strings.Contains(got, "atlas lens build") {
+		t.Errorf("rendered badge should append actionable hint when lens warn, got %q", got)
+	}
+	if !strings.Contains(got, "PUBLISHING.md") {
+		t.Errorf("rendered badge should reference docs, got %q", got)
+	}
+}

@@ -651,6 +651,98 @@ def _hf_token() -> Optional[str]:
             or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
 
 
+def _gh_available() -> bool:
+    """Best-effort probe for the gh CLI on PATH. Used by the publish
+    pre-flight so we can tell the user up front whether the registry PR
+    will auto-open or whether they'll need to paste the body manually."""
+    import shutil
+    return shutil.which("gh") is not None
+
+
+def _huggingface_hub_available() -> bool:
+    """Probe-only check that huggingface_hub imports. Lazy and quiet —
+    we don't want to fail the whole CLI just because the user hasn't
+    installed it yet; publish itself catches the ImportError too."""
+    try:
+        import huggingface_hub  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def publish_preflight(kind: str, dry_run: bool, color: bool) -> bool:
+    """Print the requirements block at the start of a publish run.
+
+    Shared by both `atlas lens publish` and `atlas asa publish` so the
+    contributor sees the same explicit "here's what publishing involves
+    and what you need" panel regardless of which artifact they're shipping.
+
+    Returns False if a hard requirement is missing AND we're not in
+    --dry-run mode; the caller should bail with exit 1 in that case.
+    Dry-run skips the auth gates entirely since nothing leaves the host.
+
+    `kind` is "lens" or "asa" — only affects the printed wording.
+    """
+    GREEN_ = GREEN if color else ""
+    RED_ = RED if color else ""
+    YELL_ = YELL if color else ""
+    RESET_ = RESET if color else ""
+
+    _safe_print("")
+    _safe_print(f"  atlas {kind} publish — submission pre-flight")
+    _safe_print(f"  ──────────────────────────────────────────")
+    _safe_print(f"  Publish does TWO things in one command:")
+    _safe_print(f"    1. Uploads the artifact to a HuggingFace repo you own")
+    _safe_print(f"    2. Opens a registry PR against github.com/itigges22/ATLAS")
+    _safe_print(f"  Full walkthrough: docs/PUBLISHING.md")
+    _safe_print("")
+
+    token_ok = bool(_hf_token())
+    hf_pkg_ok = _huggingface_hub_available()
+    gh_ok = _gh_available()
+
+    def _row(label: str, ok: bool, required: bool, hint: str) -> None:
+        if ok:
+            mark = f"{GREEN_}✓{RESET_}"
+        elif required:
+            mark = f"{RED_}✗{RESET_}"
+        else:
+            mark = f"{YELL_}⚠{RESET_}"
+        suffix = "" if ok else f"  {hint}"
+        _safe_print(f"  {mark} {label}{suffix}")
+
+    _row("HF_TOKEN env var",
+         token_ok, required=True,
+         hint=(f"{RED_}required{RESET_} — get a write token at "
+               "https://huggingface.co/settings/tokens, then "
+               "`export HF_TOKEN=hf_...`"))
+    _row("huggingface_hub Python pkg",
+         hf_pkg_ok, required=True,
+         hint=(f"{RED_}required{RESET_} — `pip install huggingface_hub`"))
+    _row("gh CLI",
+         gh_ok, required=False,
+         hint=(f"{YELL_}optional{RESET_} — without it we'll print the PR "
+               "body for you to paste at "
+               "https://github.com/itigges22/ATLAS/compare"))
+    _safe_print("")
+
+    if dry_run:
+        _safe_print(f"  {YELL_}--dry-run{RESET_}: skipping auth gates "
+                    f"(no upload, no PR will be opened)")
+        _safe_print("")
+        return True
+
+    missing_required = (not token_ok) or (not hf_pkg_ok)
+    if missing_required:
+        _safe_print(f"  {RED_}Cannot continue: missing required credentials.{RESET_}")
+        _safe_print(f"  Fix the items marked ✗ above, then re-run. "
+                    f"Or use --dry-run to preview the PR body without uploading.")
+        _safe_print("")
+        return False
+
+    return True
+
+
 def _render_model_card_md(model_name: str, base_model: str, dim: int,
                            sha256: str, size_bytes: int,
                            license_id: str, files_uploaded: List[str]) -> str:
@@ -779,12 +871,16 @@ def _emit_publish(args: argparse.Namespace, color: bool) -> int:
     """Upload local artifacts to HF + generate a registry-add PR body.
 
     Pipeline (matches PC-059 issue spec):
+      0. publish_preflight: print requirements panel + bail if creds missing
       1. Validate: artifact dir exists + cost_field.pt is in it
       2. Compute SHA256 for the registry entry
       3. (Unless --dry-run) upload artifacts + auto-generated model card to HF
       4. Render the registry-PR markdown
       5. (Unless --skip-pr) try `gh pr create`; otherwise print body
     """
+    if not publish_preflight("lens", dry_run=args.dry_run, color=color):
+        return 1
+
     atlas_root = _atlas_root()
 
     # 1. Resolve artifacts

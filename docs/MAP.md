@@ -214,6 +214,7 @@ Every file in the repository. Click any directory in the tree to jump to its des
   - [`CLI.md`](#docs) — CLI usage, streaming output, troubleshooting
   - [`CONFIGURATION.md`](#docs) — All environment variables and settings
   - [`MAP.md`](#docs) — This file
+  - [`PUBLISHING.md`](#docs) — Contributor walkthrough: publishing Lens + ASA artifacts back to ATLAS
   - [`SETUP.md`](#docs) — Installation guide (Docker, bare-metal, K3s)
   - [`TROUBLESHOOTING.md`](#docs) — Common issues and solutions
   - [`reports/`](#docs-reports) — Ablation studies, status tracking, migration guides
@@ -546,6 +547,7 @@ Each loader downloads from HuggingFace (JSON rows API, no pyarrow) and normalize
 | [`CLI.md`](CLI.md) | CLI usage, streaming output format, workflow examples, troubleshooting |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Every environment variable across all services, internal constants, K3s config |
 | [`MAP.md`](MAP.md) | This file — repository file map |
+| [`PUBLISHING.md`](PUBLISHING.md) | Contributor walkthrough: HF + GitHub publish flow for Lens / ASA artifacts (PC-059, PC-061) |
 | [`SETUP.md`](SETUP.md) | Installation: Docker Compose, bare-metal, K3s |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Common issues and solutions |
 <a id="docs-reports"></a>

@@ -507,6 +507,9 @@ Feb 2026 ASA paper (arxiv 2602.04935).
 
 
 def _emit_publish(args: argparse.Namespace, color: bool) -> int:
+    if not lens_module.publish_preflight("asa", dry_run=args.dry_run, color=color):
+        return 1
+
     if not args.dry_run and not args.repo:
         _safe_print(f"  {RED if color else ''}--repo HF_USERNAME/REPO_NAME "
                     f"is required (or pass --dry-run to skip upload)."

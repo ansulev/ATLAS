@@ -258,10 +258,17 @@ def test_build_refuses_when_docker_missing(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 def test_publish_requires_repo_unless_dry_run(monkeypatch, tmp_path, capsys):
-    """--repo required when actually uploading."""
+    """--repo required when actually uploading. Set HF_TOKEN so the
+    publish_preflight passes — we want to isolate this test to the --repo
+    enforcement, not the auth gate."""
+    from atlas.cli.commands import lens as lens_module
+    if not lens_module._huggingface_hub_available():
+        import pytest
+        pytest.skip("huggingface_hub not installed on this host")
     vp = tmp_path / "v.gguf"
     vp.write_bytes(b"GGUF" + b"\x00" * 100)
     monkeypatch.setenv("ATLAS_CONTROL_VECTOR", str(vp))
+    monkeypatch.setenv("HF_TOKEN", "hf_dummy_for_test")
     rc = asa.main(["publish", "--no-color"])
     out = capsys.readouterr().out
     assert rc == 1
