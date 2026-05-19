@@ -257,10 +257,12 @@ def test_amd_probe_renders_rocm_backend(tmp_path, monkeypatch, capsys):
     assert "docker-compose.rocm.yml" in body
 
 
-def test_apple_silicon_probe_refuses_until_v3_1_2(tmp_path, monkeypatch, capsys):
-    """Probe reporting an Apple Silicon GPU triggers wizard refusal —
-    Metal backend isn't packaged in V3.1.1 (Docker can't passthrough
-    to Apple GPUs anyway; needs native install path)."""
+def test_apple_silicon_probe_offers_vulkan_fallback(tmp_path, monkeypatch, capsys):
+    """Apple Silicon hosts get the Vulkan-via-MoltenVK fallback offered
+    when Metal isn't packaged (PC-114). The Metal-is-V3.1.2 message
+    still appears so the user knows the fast path exists, but the
+    wizard no longer hard-refuses — Vulkan-on-darwin lets them at
+    least boot the stack via Docker."""
     apple_gpu = tier.GPUInfo(vendor="apple", name="Apple M3 Pro",
                               vram_gb=18.0, compute_target=None, index=0)
     apple_probe = tier.Probe(
@@ -268,15 +270,77 @@ def test_apple_silicon_probe_refuses_until_v3_1_2(tmp_path, monkeypatch, capsys)
         vram_gb=18.0, gpu_count=1, gpus=[apple_gpu],
         system_ram_gb=18.0, cpu_cores=11, disk_free_gb=200.0, platform="darwin")
     monkeypatch.setattr(tier, "probe", lambda install_dir=None: apple_probe)
+    # Force vulkan_available() True on this fake darwin host — the
+    # production tier.vulkan_available checks sys.platform but we're
+    # running these tests on Linux.
+    monkeypatch.setattr(tier, "vulkan_available", lambda: True)
 
     root = _make_atlas_root(tmp_path)
     rc = _run(monkeypatch, root,
               ["--yes", "--skip-download", "--no-color"])
-    assert rc == 1
     out = capsys.readouterr().out
+    # Metal-is-V3.1.2 message still emitted so the user knows the fast
+    # native path exists (the slow Vulkan-via-MoltenVK fallback isn't
+    # the recommended end state for Mac users).
     assert "Metal" in out
     assert "V3.1.2" in out
-    # .env must NOT be written when the wizard refuses.
+    # New behavior — --yes accepts the Vulkan fallback offer.
+    assert "Vulkan" in out
+    assert rc == 0
+    body = pathlib.Path(root, ".env").read_text()
+    assert "ATLAS_BACKEND=vulkan" in body
+
+
+def test_apple_silicon_refuses_when_vulkan_fallback_declined(
+    tmp_path, monkeypatch, capsys
+):
+    """When the user says no to the Vulkan fallback offer, the wizard
+    still refuses (writes nothing) rather than proceeding with an
+    unsupported backend. This is the explicit-decline path."""
+    apple_gpu = tier.GPUInfo(vendor="apple", name="Apple M3 Pro",
+                              vram_gb=18.0, compute_target=None, index=0)
+    apple_probe = tier.Probe(
+        has_gpu=True, gpu_name=apple_gpu.name, gpu_vendor="apple",
+        vram_gb=18.0, gpu_count=1, gpus=[apple_gpu],
+        system_ram_gb=18.0, cpu_cores=11, disk_free_gb=200.0, platform="darwin")
+    monkeypatch.setattr(tier, "probe", lambda install_dir=None: apple_probe)
+    monkeypatch.setattr(tier, "vulkan_available", lambda: True)
+    # Interactive mode but stdin returns "n" to the Vulkan prompt.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a, **kw: "n")
+
+    root = _make_atlas_root(tmp_path)
+    # Note: NO --yes here so the prompt actually runs and gets the "n".
+    rc = _run(monkeypatch, root,
+              ["--skip-download", "--no-color"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "Vulkan" in out
+    # .env must NOT be written when the user explicitly declines.
+    assert not os.path.isfile(os.path.join(root, ".env"))
+
+
+def test_apple_silicon_refuses_when_vulkan_unavailable(
+    tmp_path, monkeypatch, capsys
+):
+    """Edge: Apple Silicon + vulkan_available()=False (e.g. some weird
+    container build that strips MoltenVK) → no fallback exists, wizard
+    must refuse rather than write a broken .env."""
+    apple_gpu = tier.GPUInfo(vendor="apple", name="Apple M3 Pro",
+                              vram_gb=18.0, compute_target=None, index=0)
+    apple_probe = tier.Probe(
+        has_gpu=True, gpu_name=apple_gpu.name, gpu_vendor="apple",
+        vram_gb=18.0, gpu_count=1, gpus=[apple_gpu],
+        system_ram_gb=18.0, cpu_cores=11, disk_free_gb=200.0, platform="darwin")
+    monkeypatch.setattr(tier, "probe", lambda install_dir=None: apple_probe)
+    monkeypatch.setattr(tier, "vulkan_available", lambda: False)
+
+    root = _make_atlas_root(tmp_path)
+    rc = _run(monkeypatch, root,
+              ["--yes", "--skip-download", "--no-color"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "Vulkan fallback isn't available" in out
     assert not os.path.isfile(os.path.join(root, ".env"))
 
 
@@ -416,3 +480,85 @@ def test_non_tty_stdin_is_treated_as_yes(tmp_path, monkeypatch):
               ["--skip-download", "--no-color"])
     assert rc == 0
     assert os.path.isfile(os.path.join(root, ".env"))
+
+
+# ---------------------------------------------------------------------------
+# Vulkan universal backend (PC-114, #114)
+# ---------------------------------------------------------------------------
+
+def test_backend_vulkan_override_writes_vulkan_into_env(tmp_path, monkeypatch):
+    """--backend vulkan forces ATLAS_BACKEND=vulkan in .env regardless of
+    detected GPU vendor. Lets a user opt into the universal fallback
+    even on a CUDA-capable box (e.g. to smoke-test the Vulkan path)."""
+    root = _make_atlas_root(tmp_path)
+    rc = _run(monkeypatch, root,
+              ["--yes", "--skip-download", "--no-color",
+               "--backend", "vulkan"])
+    assert rc == 0
+    body = pathlib.Path(root, ".env").read_text()
+    assert "ATLAS_BACKEND=vulkan" in body
+    # The vulkan-specific compose hint should appear in the header so
+    # operators don't accidentally bring the stack up with only the base
+    # file (which would route llama-server to the CUDA image).
+    assert "docker-compose.vulkan.yml" in body
+
+
+def test_backend_vulkan_override_skips_vendor_compat_check(tmp_path, monkeypatch):
+    """The --backend override short-circuits the vendor-isn't-packaged
+    refusal path. Without this, --backend vulkan would still bail on a
+    host with an Intel iGPU (since intel maps to the SYCL backend that
+    isn't packaged yet)."""
+    root = _make_atlas_root(tmp_path)
+    # Simulate an Intel iGPU (intel → sycl → not packaged → would normally refuse).
+    intel_probe = tier.Probe(
+        has_gpu=True, gpu_name="Intel Arc A770", vram_gb=16.0, gpu_count=1,
+        system_ram_gb=64.0, cpu_cores=16, disk_free_gb=500.0, platform="linux",
+        gpu_vendor="intel")
+    monkeypatch.setattr(tier, "probe", lambda install_dir=None: intel_probe)
+
+    rc = _run(monkeypatch, root,
+              ["--yes", "--skip-download", "--no-color",
+               "--backend", "vulkan"])
+    assert rc == 0
+    body = pathlib.Path(root, ".env").read_text()
+    assert "ATLAS_BACKEND=vulkan" in body
+
+
+def test_vulkan_available_returns_true_with_vulkaninfo_on_path(monkeypatch):
+    """tier.vulkan_available() should return True when vulkaninfo is
+    found on PATH — the cheapest reliable signal that the host can
+    run Vulkan."""
+    monkeypatch.setattr("shutil.which",
+                        lambda name: "/usr/bin/vulkaninfo" if name == "vulkaninfo" else None)
+    assert tier.vulkan_available() is True
+
+
+def test_vulkan_available_returns_true_with_dev_dri(monkeypatch):
+    """Even without vulkaninfo on the host, /dev/dri presence means the
+    Vulkan-in-container path will work (Mesa ICDs inside the image
+    handle the rest)."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("os.path.exists",
+                        lambda p: True if p == "/dev/dri" else False)
+    assert tier.vulkan_available() is True
+
+
+def test_vulkan_available_returns_true_on_darwin(monkeypatch):
+    """macOS hosts get True regardless (MoltenVK + Docker Desktop on Mac
+    provides the Vulkan path even with no native vulkaninfo)."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("os.path.exists", lambda p: False)
+    monkeypatch.setattr(tier, "detect_gpu", lambda: [])
+    monkeypatch.setattr("sys.platform", "darwin")
+    assert tier.vulkan_available() is True
+
+
+def test_vulkan_available_false_when_no_signal(monkeypatch):
+    """No vulkaninfo, no /dev/dri, not macOS, no detected GPU →
+    Vulkan probably won't work even via lavapipe. Return False so the
+    wizard refuses cleanly instead of writing a doomed .env."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("os.path.exists", lambda p: False)
+    monkeypatch.setattr(tier, "detect_gpu", lambda: [])
+    monkeypatch.setattr("sys.platform", "linux")
+    assert tier.vulkan_available() is False

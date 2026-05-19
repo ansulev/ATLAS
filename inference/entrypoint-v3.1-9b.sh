@@ -71,6 +71,28 @@ case "$ATLAS_BACKEND" in
       export HSA_OVERRIDE_GFX_VERSION="$ATLAS_HSA_OVERRIDE_GFX_VERSION"
     fi
     ;;
+  vulkan)
+    # Vulkan universal backend (#114). The same llama-server binary runs
+    # on any Vulkan-capable ICD: Mesa RADV (AMD), Mesa ANV (Intel),
+    # nvidia-container-toolkit's libGLX_nvidia (NVIDIA), MoltenVK (Apple
+    # via QEMU), Adreno (Snapdragon), or lavapipe (CPU software). The
+    # compose overlay decides which ICD by setting device passthrough +
+    # NVIDIA_DRIVER_CAPABILITIES; the entrypoint itself stays neutral.
+    #
+    # GGML_VK_VISIBLE_DEVICES: equivalent to CUDA_VISIBLE_DEVICES /
+    # HIP_VISIBLE_DEVICES — pins to a specific Vulkan physical device
+    # index when the host has multiple ICDs (e.g. iGPU + dGPU).
+    if [ -n "$ATLAS_GPU_INDEX" ] && [ -z "$GGML_VK_VISIBLE_DEVICES" ]; then
+      export GGML_VK_VISIBLE_DEVICES="$ATLAS_GPU_INDEX"
+    fi
+    # MESA_VK_DEVICE_SELECT: Mesa-specific selector ("vendorID:deviceID"
+    # or "DeviceName"). Operator can set ATLAS_VK_DEVICE_SELECT to force
+    # a specific physical device when GGML_VK_VISIBLE_DEVICES isn't
+    # granular enough (e.g. two Intel Arc cards).
+    if [ -n "$ATLAS_VK_DEVICE_SELECT" ]; then
+      export MESA_VK_DEVICE_SELECT="$ATLAS_VK_DEVICE_SELECT"
+    fi
+    ;;
   metal|sycl)
     echo "Warning: ATLAS_BACKEND=$ATLAS_BACKEND but this entrypoint runs in Docker."
     echo "  Metal requires native install (V3.1.2 planned). SYCL is roadmap."

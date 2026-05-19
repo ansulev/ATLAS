@@ -1,0 +1,115 @@
+# ATLAS llama-server inference image — Vulkan universal backend (PC-114, #114).
+#
+# Parallel to Dockerfile.v31 (NVIDIA CUDA) and Dockerfile.rocm (AMD ROCm/HIP).
+# Same llama.cpp build with the Vulkan compute backend instead of CUDA/HIP,
+# same PC-202 hidden-states patch, same entrypoint contract.
+#
+# Why Vulkan: it's the safety-net backend. Vulkan ICDs exist for NVIDIA
+# (via nvidia-container-toolkit), AMD (Mesa RADV in this image), Intel
+# (Mesa ANV in this image), Apple Silicon (MoltenVK via QEMU on macOS
+# Docker — slow but functional), Snapdragon Adreno (no CUDA/ROCm option
+# at all there, so Vulkan is the ONLY path), and CPU lavapipe fallback
+# (Mesa software rasterizer — very slow but means everyone can boot).
+#
+# Bring up via:
+#   docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+#
+# Tradeoff vs the native backends: typically 20–40% slower than CUDA on
+# the same NVIDIA card (compute shaders have more overhead than tuned
+# CUDA kernels). Worth it for the long-tail hardware coverage; not worth
+# it as the default when CUDA/ROCm/Metal is available on the host.
+# `atlas init` should pick native first, fall back to Vulkan only when
+# the vendor isn't covered by the other Dockerfiles.
+
+ARG UBUNTU_TAG=22.04
+FROM ubuntu:${UBUNTU_TAG} AS builder
+
+# Build deps:
+#   git + cmake + build-essential — standard toolchain
+#   libvulkan-dev + vulkan-tools     — Vulkan headers + vulkaninfo at build time
+#   glslc                            — compiles GLSL compute shaders (llama.cpp
+#                                       embeds them as SPIR-V via this tool;
+#                                       packaged in glslang-tools on Ubuntu).
+#   pkg-config                       — cmake's FindVulkan uses it
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git cmake build-essential ca-certificates pkg-config \
+        libvulkan-dev vulkan-tools glslang-tools && \
+    rm -rf /var/lib/apt/lists/*
+
+# Use /llama.cpp/tmp for build temp to avoid /tmp space exhaustion.
+ENV TMPDIR=/llama.cpp/tmp
+
+# PC-202 patch — same one CUDA + ROCm use. Surfaces per-layer residuals
+# from /embedding so the lens can score per-step. Backend-agnostic; the
+# patch is on the server-side request/response shape, not the GPU kernels.
+COPY patches/ /patches/
+
+# Shallow + single-branch clone (rationale: same as Dockerfile.v31 —
+# full history is ~1GB and chokes on flaky connections).
+RUN git -c http.postBuffer=524288000 \
+        -c http.lowSpeedLimit=1000 \
+        -c http.lowSpeedTime=60 \
+        clone --depth 1 --single-branch \
+        https://github.com/ggml-org/llama.cpp /llama.cpp && \
+    cd /llama.cpp && \
+    mkdir -p /llama.cpp/tmp && \
+    # ATLAS patch: prevent --embeddings from poisoning the draft model context.
+    # Same defensive sed as the CUDA/ROCm builds — harmless when absent.
+    sed -i '/auto params_dft = params_base;/a\        params_dft.embedding = false;  // ATLAS: draft never needs embeddings' \
+        tools/server/server-context.cpp 2>/dev/null || true && \
+    # ATLAS PC-202: expose per-layer residual hidden states from /embedding.
+    git apply --check /patches/expose-hidden-states.patch && \
+    git apply         /patches/expose-hidden-states.patch && \
+    # GGML_VULKAN=ON enables the Vulkan compute backend. No GPU-arch fan-out
+    # needed (unlike CUDA's per-CC builds or HIP's per-gfx builds) because
+    # Vulkan compiles compute shaders to SPIR-V once and the vendor driver
+    # JITs to native at runtime — the same binary runs on every supported
+    # ICD without rebuild.
+    cmake -B build \
+        -DGGML_VULKAN=ON \
+        -DBUILD_SHARED_LIBS=OFF && \
+    cmake --build build --config Release -j5
+
+# ---------------------------------------------------------------------------
+# Runtime stage — Ubuntu base with the Vulkan loader + Mesa ICDs for
+# AMD (RADV) and Intel (ANV). NVIDIA users mount the NVIDIA ICD via
+# nvidia-container-toolkit (compose overlay sets NVIDIA_DRIVER_CAPABILITIES
+# to include `graphics` so the toolkit copies in libGLX_nvidia +
+# nvidia_icd.json). CPU lavapipe ICD comes with mesa-vulkan-drivers
+# automatically so the "no GPU" case still produces a working (slow)
+# inference path.
+# ---------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_TAG}
+
+# Runtime deps:
+#   libvulkan1               — the Vulkan loader (calls into ICDs)
+#   mesa-vulkan-drivers      — RADV (AMD), ANV (Intel), lavapipe (CPU)
+#   vulkan-tools             — vulkaninfo for `atlas doctor` diagnostics
+#   libgomp1                 — llama.cpp's OpenMP threading runtime
+#   ca-certificates          — for any HF/HTTPS calls at runtime
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libvulkan1 mesa-vulkan-drivers vulkan-tools \
+        libgomp1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /llama.cpp/build/bin/llama-server /usr/local/bin/
+COPY --from=builder /llama.cpp/build/bin/llama-cli /usr/local/bin/
+# Ship cvector-generator alongside llama-server so the ASA steering-
+# vector build (BiasBusters #4) can run as a one-shot container without
+# a separate llama.cpp install on the host. Same as CUDA + ROCm images.
+COPY --from=builder /llama.cpp/build/bin/llama-cvector-generator /usr/local/bin/
+
+RUN mkdir -p /models /templates
+COPY templates/ /templates/
+COPY entrypoint-v3.1-9b.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# No GPU-specific device passthrough or group_add here — the compose
+# overlay (docker-compose.vulkan.yml) handles those because they depend
+# on which Vulkan ICD the user is targeting (NVIDIA toolkit vs /dev/dri
+# vs neither for CPU lavapipe).
+
+EXPOSE 8000
+ENTRYPOINT ["/entrypoint.sh"]

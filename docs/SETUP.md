@@ -208,6 +208,34 @@ The ROCm path is identical to NVIDIA *except* for these three points:
 
 For "I have an unsupported GPU but ROCm sort-of works on it" cases (older Vega, RDNA1), see [TROUBLESHOOTING.md § AMD GPU not detected](TROUBLESHOOTING.md) for the `ATLAS_HSA_OVERRIDE_GFX_VERSION` workaround.
 
+#### Vulkan — the universal fallback (PC-114)
+
+When the native vendor backend isn't packaged for your hardware (Intel Arc, Snapdragon Adreno, older AMD without ROCm 6.x, or some weird combo), Vulkan is the safety-net path. **One Dockerfile, runs on basically everything** — Mesa RADV (AMD), Mesa ANV (Intel), nvidia-container-toolkit (NVIDIA), MoltenVK (Apple via macOS Docker), Adreno (Snapdragon), and Mesa lavapipe (pure CPU fallback).
+
+Tradeoff: typically 20–40% slower than tuned native backends. Use it when CUDA/ROCm isn't an option, or for "does ATLAS even boot on my weird laptop" smoke testing.
+
+```bash
+# Option A — let atlas init pick it for you
+# (the wizard offers Vulkan when your GPU vendor's native backend isn't packaged,
+#  or run with --backend vulkan to force it regardless of vendor):
+atlas init --backend vulkan
+docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+
+# Option B — already-installed deployment, just switch the override file:
+docker compose -f docker-compose.yml -f docker-compose.vulkan.yml up -d
+# (the entrypoint dispatches on ATLAS_BACKEND, which the compose overlay
+#  sets to vulkan; .env's value is ignored when the overlay is in play)
+```
+
+What's different from CUDA/ROCm:
+
+1. **No vendor-specific kernel driver requirement.** Vulkan ICDs live inside the image (`mesa-vulkan-drivers` covers AMD/Intel/CPU; NVIDIA's ICD comes from the nvidia-container-toolkit mount).
+2. **`/dev/dri` passthrough only** — no `/dev/kfd`, no `--gpus all` (unless you're routing through the NVIDIA toolkit, in which case both still work).
+3. **Per-GPU selection via `ATLAS_VK_DEVICE_SELECT`** instead of `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES`. Format is Mesa-standard: `"vendorID:deviceID"` (hex) or a substring of the device name. `GGML_VK_VISIBLE_DEVICES` (numeric index) also works.
+4. **`atlas doctor`** runs a `_check_vulkan_via_docker` probe — but only when `ATLAS_BACKEND=vulkan` is set (otherwise it skips to keep CUDA/ROCm runs fast).
+
+If you hit `vulkaninfo` showing only the `llvmpipe` CPU device when you expected a GPU, the kernel-side device passthrough failed — verify `/dev/dri/renderD*` exists on the host and your user is in the `video` + `render` groups (same as the ROCm requirement above).
+
 ### What Happens on First Run
 
 1. Docker pulls 5 prebuilt container images from

@@ -226,6 +226,73 @@ def _check_amd_via_docker() -> CheckResult:
     return CheckResult("gpu", "pass", f"[amd] {summary}")
 
 
+def _check_vulkan_via_docker() -> CheckResult:
+    """Verify Vulkan device passthrough by running vulkaninfo inside a
+    minimal Mesa-Vulkan container (PC-114, #114).
+
+    Unlike CUDA / ROCm this doesn't require a vendor-specific runtime
+    or kernel driver — just /dev/dri passthrough so the Mesa ICDs
+    (RADV/ANV/lavapipe) inside the image can find a device. NVIDIA
+    users on Vulkan still need the toolkit (same as CUDA path) but
+    that's caught by `check_gpu` separately.
+
+    We use the same ubuntu+mesa stack the production Dockerfile.vulkan
+    builds on so this validates the exact compat surface the runtime
+    image will see. The throwaway container is ~150 MB after first
+    pull — bigger than the ROCm check's terminal image but still
+    bounded.
+    """
+    # /dev/dri may not exist on hosts with no GPU at all (or macOS Docker
+    # Desktop). Short-circuit before touching docker — produces a clean
+    # "no GPU passthrough" message instead of a confusing docker error.
+    if not os.path.exists("/dev/dri"):
+        return CheckResult("vulkan", "warn",
+            "no /dev/dri on host — Vulkan container would only see "
+            "the CPU lavapipe ICD (very slow)",
+            "On Linux: install kernel modules for your GPU + ensure "
+            "the render-node devices exist. On macOS: Vulkan-in-Docker "
+            "uses MoltenVK via qemu; native install (#32) is the fast path.")
+    rc, out, err = _run([
+        "docker", "run", "--rm",
+        "--device=/dev/dri",
+        "--group-add", "video", "--group-add", "render",
+        "ubuntu:22.04",
+        "bash", "-c",
+        # apt-install Mesa Vulkan stack + run vulkaninfo summary. Cap
+        # output so a verbose ICD enum doesn't blow our 300-char detail
+        # budget.
+        "apt-get update -qq >/dev/null && "
+        "apt-get install -y -qq libvulkan1 mesa-vulkan-drivers vulkan-tools "
+        ">/dev/null 2>&1 && "
+        "vulkaninfo --summary 2>&1 | head -40",
+    ], timeout=300)  # apt + image pull on cold cache
+    if rc != 0:
+        joined = (err + out).lower()
+        if "permission denied" in joined or "no such device" in joined:
+            return CheckResult("vulkan", "fail",
+                "Vulkan device passthrough failed — check render/video "
+                "group membership on the host",
+                (err or out).strip()[:300])
+        if "could not find any vulkan" in joined:
+            return CheckResult("vulkan", "warn",
+                "Vulkan loader found no ICDs (no GPU drivers visible to "
+                "the container; lavapipe CPU fallback would still work)",
+                (err or out).strip()[:300])
+        return CheckResult("vulkan", "fail",
+            "vulkaninfo failed inside the test container",
+            (err or out).strip()[:300])
+    # Pull a one-line summary out of vulkaninfo's `deviceName = ...` rows.
+    devices = [ln.split("=")[-1].strip() for ln in out.splitlines()
+               if "deviceName" in ln]
+    if not devices:
+        return CheckResult("vulkan", "warn",
+            "vulkaninfo ran but no deviceName lines — Vulkan stack is "
+            "responsive but couldn't enumerate physical devices",
+            out.strip()[:200])
+    summary = "; ".join(d[:60] for d in devices[:3])
+    return CheckResult("vulkan", "pass", f"[vulkan] {len(devices)} ICD(s): {summary}")
+
+
 def _compose_ps(project_dir: str) -> List[Dict]:
     """Run `docker compose ps --format json` and parse (handles both NDJSON and array forms).
 
@@ -811,6 +878,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # AMD: /dev/kfd passthrough). Slow on first run since each vendor
     # branch pulls a small base image (~500 MB CUDA, ~2 GB ROCm).
     results.append(check_gpu())
+
+    # 3.5. Vulkan ICD passthrough (PC-114) — only fires when the user
+    # has explicitly opted into the Vulkan backend via ATLAS_BACKEND.
+    # Skipping by default keeps doctor cheap on CUDA/ROCm hosts where
+    # the apt-install-vulkan-tools step inside the check container
+    # would add ~30s for no signal.
+    if os.environ.get("ATLAS_BACKEND") == "vulkan":
+        results.append(_check_vulkan_via_docker())
 
     # 4. Compose stack — pass atlas_root as cwd so compose finds
     # docker-compose.yml even when doctor is invoked from elsewhere

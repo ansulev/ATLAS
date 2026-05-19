@@ -332,6 +332,40 @@ def detect_gpu() -> List[GPUInfo]:
     return gpus
 
 
+def vulkan_available() -> bool:
+    """Probe whether the Vulkan universal backend (PC-114) can run on
+    this host. Used by the `atlas init` wizard to decide whether to
+    offer `vulkan` as a fallback when no recognized vendor's native
+    backend is available.
+
+    Lenient on purpose: we want the wizard to be able to suggest Vulkan
+    even on hosts without vulkaninfo (the runtime stack lives inside the
+    docker image — mesa-vulkan-drivers covers Mesa RADV/ANV/lavapipe).
+    True when ANY of these is true:
+      1. vulkaninfo is on PATH (most reliable signal)
+      2. /dev/dri exists (Linux GPU rendering nodes — covers AMD/Intel
+         and NVIDIA-via-toolkit cases for Vulkan in the container)
+      3. host is macOS (MoltenVK path via QEMU + Docker Desktop)
+      4. there's already a detected GPU (worst-case, Vulkan via lavapipe
+         CPU fallback inside the container will at least boot)
+
+    False when none of those hold — typically a non-Linux/non-macOS host
+    with no GPU at all, where the container couldn't even fall back to
+    lavapipe sensibly.
+    """
+    if shutil.which("vulkaninfo"):
+        return True
+    if os.path.exists("/dev/dri"):
+        return True
+    if sys.platform == "darwin":
+        return True
+    # Last-resort: if the regular GPU probes found ANYTHING, Vulkan-in-
+    # docker will probably work even without host-side vulkaninfo.
+    if detect_gpu():
+        return True
+    return False
+
+
 def primary_gpu(gpus: List[GPUInfo],
                 override_vendor: Optional[str] = None,
                 override_index: Optional[int] = None) -> Optional[GPUInfo]:

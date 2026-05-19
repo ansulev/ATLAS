@@ -298,8 +298,20 @@ def _step_select_model(profile: tier.TierProfile,
 
     if selected_gpu is not None:
         backend_id, backend_name, supported = _backend_for(selected_gpu.vendor)
-        if not supported:
-            _safe_print(f"  {RED if color else ''}Selected GPU vendor "
+        # Operator-forced backend (--backend vulkan) short-circuits the
+        # vendor probe entirely. Useful for users who want the universal
+        # fallback even when their card has native support, or to test
+        # the Vulkan path on a CUDA box.
+        if args.backend:
+            _safe_print(f"  --backend {args.backend} requested — overriding "
+                        f"the vendor-default ({backend_name}).")
+        elif not supported:
+            # PC-114 (#114): when the native backend isn't packaged, offer
+            # Vulkan as the universal fallback before refusing. Vulkan
+            # works on Apple Silicon (via MoltenVK), Intel Arc (Mesa
+            # ANV), Snapdragon Adreno, and CPU lavapipe — covering the
+            # gap left by the cuda/rocm-only matrix.
+            _safe_print(f"  {YELL if color else ''}Selected GPU vendor "
                         f"'{selected_gpu.vendor}' uses the {backend_name} backend, "
                         f"which is not yet packaged.{RESET if color else ''}")
             roadmap = {
@@ -310,9 +322,25 @@ def _step_select_model(profile: tier.TierProfile,
                            "your GPU details.",
             }
             _safe_print(f"  {roadmap.get(backend_id, '')}")
-            _safe_print("  The wizard refuses here rather than write a .env "
-                        "that won't boot.")
-            return None
+            if tier.vulkan_available():
+                _safe_print("")
+                _safe_print(f"  {GREEN if color else ''}Vulkan universal "
+                            f"backend is available as a fallback.{RESET if color else ''}")
+                _safe_print("  Vulkan covers this GPU (and the CPU lavapipe "
+                            "fallback) but runs ~20–40% slower than a tuned "
+                            "native backend would.")
+                if _confirm("Use Vulkan?", default_yes=True, args=args):
+                    args.backend = "vulkan"
+                else:
+                    _safe_print("  Refusing rather than writing a .env that "
+                                "won't boot. Re-run with --backend vulkan to "
+                                "skip this prompt next time.")
+                    return None
+            else:
+                _safe_print("  Vulkan fallback isn't available on this host "
+                            "either (no vulkaninfo, no /dev/dri, no detected "
+                            "GPU). Refusing.")
+                return None
 
     tier_default = model_registry.for_tier(profile.tier)
     supported = model_registry.supported_models()
@@ -386,8 +414,15 @@ def _step_download(m: model_registry.Model, models_dir: str,
 def _render_env(m: model_registry.Model, profile: tier.TierProfile,
                  selected_gpu: Optional[tier.GPUInfo],
                  models_dir: str, atlas_root: str, image_tag: str,
-                 ghcr_owner: str) -> str:
-    """Compose the .env body. Order is stable for diff-friendliness."""
+                 ghcr_owner: str,
+                 backend_override: Optional[str] = None) -> str:
+    """Compose the .env body. Order is stable for diff-friendliness.
+
+    `backend_override` (PC-114): when set, takes precedence over the
+    vendor-derived backend. Set by `atlas init --backend vulkan` (or
+    the wizard's Vulkan-fallback path when the native backend isn't
+    packaged).
+    """
     # models_dir written as a relative path when it's the default
     # <atlas_root>/models, absolute otherwise — keeps `.env` portable
     # across cloned checkouts that follow the same layout.
@@ -398,7 +433,14 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
     # Backend selection (V3.1.1) — drives which Dockerfile / image is used
     # and which docker-compose override files apply.
     vendor = selected_gpu.vendor if selected_gpu else "nvidia"
-    backend_id, backend_name, _ = _backend_for(vendor)
+    if backend_override:
+        backend_id = backend_override
+        # Pretty name for the .env header — keep aligned with the
+        # backend-id values the entrypoint dispatches on.
+        backend_name = {"cuda": "CUDA", "rocm": "ROCm",
+                        "vulkan": "Vulkan"}.get(backend_override, backend_override)
+    else:
+        backend_id, backend_name, _ = _backend_for(vendor)
     gpu_index = str(selected_gpu.index) if selected_gpu else "0"
 
     keys = {
@@ -438,6 +480,16 @@ def _render_env(m: model_registry.Model, profile: tier.TierProfile,
             "#   docker compose -f docker-compose.yml "
             "-f docker-compose.rocm.yml up -d")
         lines.append("")
+    elif backend_id == "vulkan":
+        lines.append(
+            "# NOTE (Vulkan, PC-114): bring the stack up with the Vulkan override:")
+        lines.append(
+            "#   docker compose -f docker-compose.yml "
+            "-f docker-compose.vulkan.yml up -d")
+        lines.append(
+            "# Vulkan is the universal fallback (~20-40% slower than tuned "
+            "native backends) — works on AMD/Intel/Snapdragon/Apple-via-MoltenVK/CPU.")
+        lines.append("")
     for k, v in keys.items():
         lines.append(f"{k}={v}")
     lines.append("")
@@ -460,7 +512,8 @@ def _step_write_env(m: model_registry.Model, profile: tier.TierProfile,
     env_path = os.path.join(atlas_root, ".env")
     body = _render_env(m, profile, selected_gpu, models_dir, atlas_root,
                        image_tag=args.image_tag,
-                       ghcr_owner=args.ghcr_owner)
+                       ghcr_owner=args.ghcr_owner,
+                       backend_override=args.backend)
     if args.dry_run:
         _safe_print(f"  (dry-run) would write {env_path} ({len(body)} bytes)")
         return env_path, None
@@ -587,6 +640,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="ATLAS_IMAGE_TAG to write into .env (default: latest)")
     parser.add_argument("--ghcr-owner", default="itigges22",
         help="ATLAS_GHCR_OWNER to write into .env (default: itigges22)")
+    parser.add_argument("--backend", default=None,
+        choices=["cuda", "rocm", "vulkan"],
+        help="force a specific llama-server backend instead of "
+             "auto-detecting from GPU vendor. `vulkan` is the universal "
+             "fallback (PC-114, #114) — works on basically any GPU + "
+             "CPU lavapipe, ~30%% slower than the native backends.")
     parser.add_argument("--no-color", action="store_true")
     args = parser.parse_args(argv)
 
@@ -643,14 +702,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     keys_path, keys_backup, api_key = _step_write_api_keys(atlas_root, args, color)
     _safe_print("")
 
-    # Next steps
-    backend_id, _, _ = _backend_for(selected_gpu.vendor if selected_gpu else None)
+    # Next steps. args.backend wins over vendor-derived since the wizard
+    # writes that into ATLAS_BACKEND above.
+    if args.backend:
+        backend_id = args.backend
+    else:
+        backend_id, _, _ = _backend_for(selected_gpu.vendor if selected_gpu else None)
     if not args.dry_run:
         _safe_print(f"{GREEN if color else ''}Setup complete.{RESET if color else ''}")
         _safe_print("Next:")
         if backend_id == "rocm":
             _safe_print("  1. docker compose -f docker-compose.yml "
                         "-f docker-compose.rocm.yml up -d   # bring up the ROCm stack")
+        elif backend_id == "vulkan":
+            _safe_print("  1. docker compose -f docker-compose.yml "
+                        "-f docker-compose.vulkan.yml up -d   # bring up the Vulkan stack")
         else:
             _safe_print("  1. docker compose up -d        # bring up the stack")
         _safe_print("  2. atlas doctor               # verify install health")
